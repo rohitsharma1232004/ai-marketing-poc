@@ -1,14 +1,12 @@
 name: Apply field revision update
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - feature/senior-review-links-field-revisions
     paths:
       - .github/workflows/apply-field-revision.yml
-  pull_request:
-    branches:
-      - main
 
 permissions:
   contents: write
@@ -23,11 +21,23 @@ jobs:
           ref: feature/senior-review-links-field-revisions
           fetch-depth: 0
 
-      - name: Assemble and apply tested patch
+      - name: Assemble and verify exact tested patch
         shell: bash
         run: |
           set -euo pipefail
-          cat .github/update_parts/part-*.txt > /tmp/senior-field-revision.patch
+          {
+            cat .github/update_exact/part-001-1.txt
+            cat .github/update_exact/part-001-2.txt
+            cat .github/update_exact/part-001-3.txt
+            cat .github/update_exact/part-002-1.txt
+            cat .github/update_exact/tiny/part-002-2-*.txt
+            cat .github/update_exact/tiny/part-002-3-*.txt
+            cat .github/update_parts/part-003.txt
+            cat .github/update_parts/part-004.txt
+            cat .github/update_parts/part-005.txt
+            cat .github/update_parts/part-006.txt
+          } > /tmp/senior-field-revision.patch
+          echo "b73650873c422ad5be60292f8565e585a3e454e083bddb9810eceeda94bcedbb  /tmp/senior-field-revision.patch" | sha256sum -c -
           git apply --check /tmp/senior-field-revision.patch
           git apply /tmp/senior-field-revision.patch
 
@@ -50,10 +60,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf .github/update_parts
+          rm -rf .github/update_parts .github/update_exact
           rm .github/workflows/apply-field-revision.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- .gitignore .streamlit/secrets.toml.example APPROVAL_WORKFLOW.md DEVELOPMENT_ROADMAP.md app.py campaign_store.py revision_logic.py senior_review_links.py tests/test_campaign_store.py tests/test_revision_logic.py tests/test_senior_review_links.py .github/update_parts .github/workflows/apply-field-revision.yml
+          git add -- .gitignore .streamlit/secrets.toml.example APPROVAL_WORKFLOW.md DEVELOPMENT_ROADMAP.md app.py campaign_store.py revision_logic.py senior_review_links.py tests/test_campaign_store.py tests/test_revision_logic.py tests/test_senior_review_links.py .github/update_parts .github/update_exact .github/workflows/apply-field-revision.yml
           git commit -m "Add secure Senior review links and field-level revisions"
           git push origin HEAD:feature/senior-review-links-field-revisions
