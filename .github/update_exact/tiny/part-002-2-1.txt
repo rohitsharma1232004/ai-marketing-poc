@@ -1,0 +1,18 @@
+r = (
+-                        "CALENDAR_GENERATION_PROVIDER must be either 'groq' or 'n8n'."
++                if not target_posts:
++                    st.error(
++                        "The Senior's selected post no longer matches this calendar version. "
++                        "Create a fresh review request before regenerating."
+                     )
+-                elif revision_provider == "groq" and not revision_groq_key:
+-                    revision_config_error = "GROQ_API_KEY is missing."
+-                elif revision_provider == "n8n" and not revision_n8n_url:
+-                    revision_config_error = "N8N_CALENDAR_WEBHOOK_URL is missing."
+-                elif revision_provider == "n8n" and not revision_n8n_secret:
+-                    revision_config_error = "N8N_WEBHOOK_SECRET is missing."
+-
+-                if revision_config_error:
+-                    st.error(revision_config_error)
+                 else:
+-                    revision_request_id = str(uuid4())
