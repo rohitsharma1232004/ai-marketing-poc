@@ -1,0 +1,17 @@
+                 validate_calendar_for_export(
+-                                latest_calendar["headers"],
+-                                revised_calendar_rows,
+-                                (campaign_record or {}).get("intake", {}).get(
+-                                    "schedule", []
+-                                ),
++                        revision_provider = get_app_setting(
++                            "CALENDAR_GENERATION_PROVIDER",
++                            DEFAULT_CALENDAR_GENERATION_PROVIDER,
++                        ).strip().lower()
++                        revision_groq_key = get_app_setting("GROQ_API_KEY")
++                        revision_groq_url = get_app_setting(
++                            "GROQ_API_URL", DEFAULT_GROQ_API_URL
++                        )
++                        revision_model = get_app_setting("GROQ_MODEL", DEFAULT_GROQ_MODEL)
++                        revision_n8n_url = get_app_setting("N8N_CALENDAR_WEBHOOK_URL")
++                      
