@@ -1,0 +1,19 @@
+                 "preserved exactly from the current calendar version."
+                     )
+-                    revision_label = (
+-                        "n8n" if revision_provider == "n8n" else "Groq"
++                    user_additional_instructions = st.text_area(
++                        "Additional Instructions from Marketing Team (optional)",
++                        max_chars=3000,
++                        key=f"revision_additional_{latest_calendar['id']}",
++                        placeholder=(
++                            "Optional add-on only. Example: Also include Sector 88 and Greater "
++                            "Faridabad where relevant. Do not contradict the Senior request."
++                        ),
+                     )
+-                    with st.spinner(
+-                        f"Regenerating Post {selected_post['post_number']} through "
+-                        f"{revision_label} ({revision_model})..."
++
++                    if st.button(
++             
