@@ -1,0 +1,16 @@
+with st.spinner(
++                                f"Regenerating {', '.join(fields_to_change)} for {scope_text} "
++                                f"through {revision_label} ({revision_model})..."
++                            ):
+                                 try:
+-                                    current_campaign = campaign_store.get_campaign(
+-                                        campaign_id
++                                    revision_result = generate_calendar_content(
++                                        provider=revision_provider,
++                                        system_prompt=CONTENT_CALENDAR_SYSTEM_PROMPT,
++                                        user_prompt=revision_prompt,
++                                        model=revision_model,
++                                        expected_posts=len(target_posts),
++                                        groq_api_key=revision_groq_key,
++                                        groq_api_url=revision_groq_url,
++  
