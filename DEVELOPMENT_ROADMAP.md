@@ -1,0 +1,118 @@
+# Current POC scope override — August 20, 2026
+
+The active demo is now intentionally limited to:
+
+`Client details -> generation -> validated content calendar -> Senior approval -> Excel download`
+
+Only one human gate is active: **Senior approval**. Client approval, FastAPI review links, and WhatsApp approval delivery are archived under `legacy_approval_whatsapp/` and are not part of the active Streamlit flow.
+
+The database keeps older two-stage fields/statuses for compatibility, but the active Excel gate checks only for a hash-matched Senior approval on the latest calendar version.
+
+# AI Marketing Operations System — Development Roadmap
+
+The content calendar is one component of the future system. Development follows
+vertical milestones so every stage can be tested before it receives publishing
+permissions.
+
+## Milestone 1 — n8n generation gateway
+
+Status: **complete and live-verified on August 19, 2026**
+
+- Preserve the existing Streamlit form and deterministic calendar validators.
+- Add explicit `groq` and `n8n` generation providers.
+- Add a versioned request/response contract and correlation ID.
+- Add an importable n8n workflow with webhook and Groq credentials kept in n8n.
+- Add mocked provider tests and a Streamlit-to-webhook integration test.
+
+Acceptance completed:
+
+- Imported and published the six-node workflow in the user's self-hosted n8n.
+- Configured separate webhook and Groq Header Auth credentials.
+- Ran a real Streamlit request through the production webhook and Groq.
+- Confirmed the resulting n8n execution completed successfully (green).
+
+## Milestone 2 — persistent campaigns and progress
+
+Status: **development POC complete; production migration in progress**
+
+Milestone 2A completed locally:
+
+- Added SQLite clients, campaigns, immutable calendar versions and workflow events.
+- Correlated every n8n request with persisted campaign and request UUIDs.
+- Added atomic transition from generation to pending_senior_review.
+- Added sequential senior then client decisions, rejection feedback, immutable
+  version/hash-bound approval records, and a fully_approved export gate.
+- Added full Campaign ID lookup and visible recent history; clearing the current
+  view never deletes records.
+- Kept uploaded document bytes/text and all credentials out of the database.
+- Added schema v3 hash-only signed review requests/sessions, consented WhatsApp
+  recipients, and a durable notification outbox.
+- Added a narrow FastAPI portal where GET cannot approve, session exchange is
+  one-use, decision POSTs are CSRF protected, and exact calendar content is escaped.
+- Added an importable official WhatsApp Business Cloud n8n template workflow.
+
+Remaining for Milestone 2:
+
+- Move the canonical schema to PostgreSQL and put admin APIs behind authentication.
+- Return asynchronous job IDs and display n8n stage-by-stage progress callbacks.
+- Add authenticated, tenant-scoped campaign and approval APIs.
+- Store documents/assets outside n8n; pass identifiers and bounded excerpts.
+
+## Milestone 3 — evidence-backed research and strategy
+
+Status: planned
+
+- Client knowledge and approved-claims store.
+- Separate business, audience, competitor and trend research sub-workflows.
+- Save URL, title, excerpt, retrieval date and confidence for every finding.
+- Generate a structured business analysis and campaign strategy before content.
+- Keep research/tool use separate from strict JSON synthesis.
+
+## Milestone 4 — complete content package
+
+Status: planned
+
+- Content ideas and calendar.
+- Captions, hashtags, carousel slides and reel scripts.
+- Design briefs and platform variants.
+- Automatic brand, claim, duplication and platform QA.
+- Freeze and hash each content-package version.
+
+## Milestone 5 — two-stage approval
+
+Status: **secure-link development POC complete; production hardening planned**
+
+- Local Streamlit now enforces senior approval before client approval and records
+  names, emails, decisions, feedback, timestamps, version IDs, and content hashes.
+- Local final Excel creation is allowed only after fully_approved.
+- Signed, expiring senior/client links and the review portal are implemented.
+- Add OTP/login/SSO so a forwarded bearer link is not sufficient identity proof.
+- Add an edit/revision workflow where every new version invalidates both prior
+  approvals and notifies the next reviewer.
+- n8n sends notifications and reacts to decisions; PostgreSQL remains the
+  approval authority.
+
+## Milestone 6 — creative production
+
+Status: planned
+
+- Start with complete design briefs and Canva handoff.
+- Add approved Canva templates and Autofill where account eligibility allows.
+- Keep an interchangeable design-provider interface for other image/video APIs.
+
+## Milestone 7 — publishing and analytics
+
+Status: planned
+
+- Start with one publishing integration and one platform pilot.
+- Recheck both approvals and content hash immediately before publishing.
+- Add idempotency keys, OAuth refresh handling, retries and a kill switch.
+- Collect normalized metrics after 24 hours, 7 days and 30 days.
+- Generate recommendations; only verified learnings update future campaigns.
+
+## Architecture rule
+
+n8n owns connections and automation. FastAPI owns authentication and business
+rules. PostgreSQL owns durable state and approvals. Groq creates analysis and
+content. The language model never receives unrestricted publishing credentials
+and never decides whether required approval exists.

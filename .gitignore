@@ -1,0 +1,17 @@
+# Local Streamlit secrets must never be committed.
+.streamlit/secrets.toml
+
+# Local environment and Python build files.
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Approved exports contain client data and stay local by default.
+approved_outputs/
+
+# Local SQLite campaign database plus WAL/SHM runtime files.
+/data/

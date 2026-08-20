@@ -1,0 +1,199 @@
+{
+  "name": "AI Marketing - Generate Calendar v1",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "v1/marketing/calendar/generate",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "713f0e5a-f913-4db0-a37d-79e99bc1a180",
+      "name": "Calendar Generate Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-720, 0],
+      "webhookId": "713f0e5a-f913-4db0-a37d-79e99bc1a180",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WEBHOOK_HEADER_AUTH",
+          "name": "Marketing App Webhook Secret"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const body = $input.first().json.body ?? {};\nconst errors = [];\nconst contractVersion = 'calendar.generate.v1';\nconst allowedModels = new Set(['openai/gpt-oss-20b', 'openai/gpt-oss-120b']);\nconst isText = (value, max) => typeof value === 'string' && value.trim().length > 0 && value.length <= max;\n\nif (body.contract_version !== contractVersion) errors.push('contract_version must be calendar.generate.v1');\nif (!isText(body.request_id, 128)) errors.push('request_id is required and must be 128 characters or fewer');\nif (body.campaign_id != null && !isText(body.campaign_id, 128)) errors.push('campaign_id must be a non-empty string of 128 characters or fewer');\nif (!allowedModels.has(body.model)) errors.push('model must be openai/gpt-oss-20b or openai/gpt-oss-120b');\nif (!Number.isInteger(body.expected_posts) || body.expected_posts < 1 || body.expected_posts > 30) errors.push('expected_posts must be an integer from 1 to 30');\nif (!isText(body.system_prompt, 20000)) errors.push('system_prompt is required and must be 20,000 characters or fewer');\nif (!isText(body.user_prompt, 40000)) errors.push('user_prompt is required and must be 40,000 characters or fewer');\n\nif (errors.length) {\n  return [{ json: { valid: false, http_status: 400, response: {\n    contract_version: contractVersion,\n    ok: false,\n    request_id: typeof body.request_id === 'string' ? body.request_id : null,\n    campaign_id: typeof body.campaign_id === 'string' ? body.campaign_id : null,\n    error: { code: 'INVALID_REQUEST', message: errors.join('; '), retryable: false }\n  }}}];\n}\n\nreturn [{ json: {\n  valid: true,\n  request_id: body.request_id,\n  campaign_id: body.campaign_id ?? null,\n  model: body.model,\n  expected_posts: body.expected_posts,\n  groq_payload: {\n    model: body.model,\n    messages: [\n      { role: 'system', content: body.system_prompt },\n      { role: 'user', content: body.user_prompt }\n    ],\n    temperature: 0.3,\n    max_completion_tokens: 4096,\n    reasoning_effort: 'low',\n    include_reasoning: false\n  }\n}}];"
+      },
+      "id": "e17fb875-5255-45a7-bd3a-34c66528328a",
+      "name": "Validate Contract and Build Groq Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-480, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a339bdd9-dcc4-46dd-9948-f5b00b9ee616",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a2216ddf-902a-41cb-b072-558ece8b9f77",
+      "name": "Request Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-240, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.groq_payload) }}",
+        "options": {
+          "timeout": 90000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "2d03131a-b43d-44c6-9149-1381657d4cf8",
+      "name": "Groq Chat Completion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [0, -96],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_GROQ_HEADER_AUTH",
+          "name": "Groq Authorization"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const upstream = $input.first().json;\nconst request = $('Validate Contract and Build Groq Request').first().json;\nconst status = Number(upstream.statusCode ?? 0);\nconst body = upstream.body && typeof upstream.body === 'object' ? upstream.body : {};\nconst contractVersion = 'calendar.generate.v1';\n\nconst failure = (httpStatus, code, message, retryable) => [{ json: {\n  http_status: httpStatus,\n  response: {\n    contract_version: contractVersion,\n    ok: false,\n    request_id: request.request_id,\n    campaign_id: request.campaign_id,\n    error: { code, message, retryable }\n  }\n}}];\n\nif (status < 200 || status >= 300) {\n  if (status === 429) return failure(429, 'GROQ_RATE_LIMIT', 'Groq rate limit reached. Try again later.', true);\n  if (status === 401 || status === 403) return failure(502, 'GROQ_AUTH_ERROR', 'The n8n Groq credential is invalid or unauthorized.', false);\n  return failure(502, 'GROQ_REQUEST_FAILED', 'Groq request failed.', status === 0 || status >= 500);\n}\n\nconst choices = Array.isArray(body.choices) ? body.choices : [];\nconst choice = choices[0] && typeof choices[0] === 'object' ? choices[0] : {};\nconst message = choice.message && typeof choice.message === 'object' ? choice.message : {};\nconst calendarMarkdown = typeof message.content === 'string' ? message.content.trim() : '';\nconst finishReason = typeof choice.finish_reason === 'string' ? choice.finish_reason : 'unknown';\n\nif (!calendarMarkdown) {\n  const code = finishReason === 'length' ? 'GROQ_OUTPUT_LIMIT' : 'GROQ_EMPTY_RESPONSE';\n  const text = finishReason === 'length' ? 'Groq reached its output limit before returning the calendar.' : 'Groq returned an empty calendar.';\n  return failure(502, code, text, true);\n}\n\nconst usage = body.usage && typeof body.usage === 'object' ? {\n  prompt_tokens: Number(body.usage.prompt_tokens ?? 0),\n  completion_tokens: Number(body.usage.completion_tokens ?? 0),\n  total_tokens: Number(body.usage.total_tokens ?? 0)\n} : null;\n\nreturn [{ json: {\n  http_status: 200,\n  response: {\n    contract_version: contractVersion,\n    ok: true,\n    request_id: request.request_id,\n    campaign_id: request.campaign_id,\n    provider: 'n8n',\n    upstream_provider: 'groq',\n    model: request.model,\n    expected_posts: request.expected_posts,\n    calendar_markdown: calendarMarkdown,\n    finish_reason: finishReason,\n    usage\n  }\n}}];"
+      },
+      "id": "70aff62c-ec2a-4d87-b363-4687dbd4f53a",
+      "name": "Build Contract Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, -96]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {
+          "responseCode": "={{ $json.http_status }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "id": "eb7edc13-2d74-4116-af41-9a529f5cfcd2",
+      "name": "Return Contract Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [496, 0]
+    }
+  ],
+  "connections": {
+    "Calendar Generate Webhook": {
+      "main": [[{
+        "node": "Validate Contract and Build Groq Request",
+        "type": "main",
+        "index": 0
+      }]]
+    },
+    "Validate Contract and Build Groq Request": {
+      "main": [[{
+        "node": "Request Valid?",
+        "type": "main",
+        "index": 0
+      }]]
+    },
+    "Request Valid?": {
+      "main": [
+        [{
+          "node": "Groq Chat Completion",
+          "type": "main",
+          "index": 0
+        }],
+        [{
+          "node": "Return Contract Response",
+          "type": "main",
+          "index": 0
+        }]
+      ]
+    },
+    "Groq Chat Completion": {
+      "main": [[{
+        "node": "Build Contract Response",
+        "type": "main",
+        "index": 0
+      }]]
+    },
+    "Build Contract Response": {
+      "main": [[{
+        "node": "Return Contract Response",
+        "type": "main",
+        "index": 0
+      }]]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata"
+  },
+  "versionId": "efdc4ca2-1fd9-40fd-b094-f0d563a97cef",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

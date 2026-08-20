@@ -1,0 +1,173 @@
+{
+  "name": "AI Marketing - WhatsApp Review Notify v1",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "v1/marketing/reviews/whatsapp/notify",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "4320c784-cfae-4cd8-87d8-4d454373d4be",
+      "name": "WhatsApp Review Notify Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-720, 0],
+      "webhookId": "4320c784-cfae-4cd8-87d8-4d454373d4be",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_REVIEW_WEBHOOK_HEADER_AUTH",
+          "name": "Review Notification Webhook Secret"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const raw = $input.first().json.body;\nconst body = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};\nconst contract = 'marketing.whatsapp-review-notification.v1';\nconst allowed = new Set(['contract_version','event_id','review_request_id','campaign_id','calendar_version_id','content_hash','role','recipient_name','recipient_phone_e164','review_due_at','review_token_suffix']);\nconst errors = [];\nconst unknown = Object.keys(body).filter((key) => !allowed.has(key));\nif (unknown.length) errors.push('unknown request fields: ' + unknown.sort().join(', '));\nconst text = (value) => typeof value === 'string' ? value.trim() : '';\nconst uuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);\nconst data = {};\nfor (const key of allowed) data[key] = text(body[key]);\nif (data.contract_version !== contract) errors.push('contract_version must be ' + contract);\nfor (const key of ['event_id','review_request_id','campaign_id','calendar_version_id']) if (!uuid(data[key])) errors.push(key + ' must be a UUID');\nif (!/^[0-9a-f]{64}$/.test(data.content_hash)) errors.push('content_hash must be a lowercase SHA-256 hex digest');\nif (!['senior','client'].includes(data.role)) errors.push('role must be senior or client');\nif (!data.recipient_name || data.recipient_name.length > 120 || /[\\u0000-\\u001f\\u007f]/.test(data.recipient_name)) errors.push('recipient_name must be 1-120 characters without control characters');\nif (!/^\\+[1-9]\\d{7,14}$/.test(data.recipient_phone_e164)) errors.push('recipient_phone_e164 must use E.164 format');\nconst dueHasZone = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|[+-]\\d{2}:\\d{2})$/.test(data.review_due_at);\nif (!dueHasZone || !Number.isFinite(Date.parse(data.review_due_at))) errors.push('review_due_at must be an ISO 8601 timestamp with a timezone');\nconst tokenParts = data.review_token_suffix.split('.');\nconst tokenExpiry = tokenParts.length === 4 && /^[1-9]\\d{0,11}$/.test(tokenParts[2]) ? Number(tokenParts[2]) : NaN;\nconst tokenShape = data.review_token_suffix.length <= 256 && tokenParts.length === 4 && tokenParts[0] === 'rv1' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(tokenParts[1]) && tokenParts[1] !== '00000000-0000-0000-0000-000000000000' && tokenParts[1] === data.review_request_id && Number.isInteger(tokenExpiry) && tokenExpiry <= 253402300799 && /^[A-Za-z0-9_-]{43}$/.test(tokenParts[3]) && Math.floor(Date.parse(data.review_due_at) / 1000) === tokenExpiry;\nif (!tokenShape) errors.push('review_token_suffix must be a bound rv1 review token');\nif (errors.length) return [{json:{valid:false,http_status:400,response:{contract_version:contract,ok:false,event_id:uuid(data.event_id)?data.event_id:null,review_request_id:uuid(data.review_request_id)?data.review_request_id:null,status:'rejected',provider:'whatsapp_cloud_api',provider_message_id:null,error:{code:'INVALID_REQUEST',message:errors.join('; '),retryable:false}}}}];\nreturn [{json:{valid:true,...data}}];"
+      },
+      "id": "b36c998e-0896-4d25-8bb9-d58144817871",
+      "name": "Validate Review Notification Contract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-480, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "62311203-32e5-437b-bc91-c990db9122fd",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9d69df30-a146-47d0-a4cd-90e08d6d73d5",
+      "name": "Request Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-240, 0]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendTemplate",
+        "phoneNumberId": "",
+        "recipientPhoneNumber": "={{ $json.recipient_phone_e164 }}",
+        "template": "content_calendar_review_v1|en_US",
+        "components": {
+          "component": [
+            {
+              "type": "body",
+              "bodyParameters": {
+                "parameter": [
+                  {"type": "text", "text": "={{ $json.recipient_name }}"},
+                  {"type": "text", "text": "={{ $json.role }}"},
+                  {"type": "text", "text": "={{ $json.campaign_id }}"},
+                  {"type": "text", "text": "={{ $json.review_due_at }}"}
+                ]
+              }
+            },
+            {
+              "type": "button",
+              "sub_type": "url",
+              "index": 0,
+              "buttonParameters": {
+                "parameter": {
+                  "type": "text",
+                  "text": "={{ $json.review_token_suffix }}"
+                }
+              }
+            }
+          ]
+        },
+        "requestOptions": {}
+      },
+      "id": "01c2f529-ffad-40fc-a531-64c9fd7d2db7",
+      "name": "Send WhatsApp Review Template",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1.1,
+      "position": [0, -96],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "whatsAppApi": {
+          "id": "REPLACE_WHATSAPP_BUSINESS_CLOUD_CREDENTIAL",
+          "name": "WhatsApp Business Cloud account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const upstream = $input.first().json;\nconst request = $('Validate Review Notification Contract').first().json;\nconst contract = 'marketing.whatsapp-review-notification.v1';\nconst fail = (code,message) => [{json:{http_status:502,response:{contract_version:contract,ok:false,event_id:request.event_id,review_request_id:request.review_request_id,status:'failed',provider:'whatsapp_cloud_api',provider_message_id:null,error:{code,message,retryable:true}}}}];\nif (upstream.error) return fail('WHATSAPP_SEND_FAILED','WhatsApp Business Cloud rejected or could not send the review notification.');\nconst providerBody = upstream.body && typeof upstream.body === 'object' ? upstream.body : upstream;\nconst messages = Array.isArray(providerBody.messages) ? providerBody.messages : [];\nconst messageId = messages[0] && typeof messages[0].id === 'string' ? messages[0].id.trim() : '';\nif (!messageId) return fail('WHATSAPP_INVALID_RESPONSE','WhatsApp Business Cloud did not return a provider message ID.');\nreturn [{json:{http_status:202,response:{contract_version:contract,ok:true,event_id:request.event_id,review_request_id:request.review_request_id,status:'accepted',provider:'whatsapp_cloud_api',provider_message_id:messageId}}}];"
+      },
+      "id": "70aed94f-aefe-46e4-8106-79ff2e934039",
+      "name": "Build Notification Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, -96]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {
+          "responseCode": "={{ $json.http_status }}",
+          "responseHeaders": {
+            "entries": [{"name": "Cache-Control", "value": "no-store"}]
+          }
+        }
+      },
+      "id": "99335605-287f-470d-97d8-b1a98ab19b53",
+      "name": "Return Notification Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [496, 0]
+    }
+  ],
+  "connections": {
+    "WhatsApp Review Notify Webhook": {
+      "main": [[{"node": "Validate Review Notification Contract", "type": "main", "index": 0}]]
+    },
+    "Validate Review Notification Contract": {
+      "main": [[{"node": "Request Valid?", "type": "main", "index": 0}]]
+    },
+    "Request Valid?": {
+      "main": [
+        [{"node": "Send WhatsApp Review Template", "type": "main", "index": 0}],
+        [{"node": "Return Notification Response", "type": "main", "index": 0}]
+      ]
+    },
+    "Send WhatsApp Review Template": {
+      "main": [[{"node": "Build Notification Response", "type": "main", "index": 0}]]
+    },
+    "Build Notification Response": {
+      "main": [[{"node": "Return Notification Response", "type": "main", "index": 0}]]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata"
+  },
+  "versionId": "2a47dd64-8bc2-4209-a91a-f0b9835a6285",
+  "meta": {"templateCredsSetupCompleted": false},
+  "tags": []
+}
