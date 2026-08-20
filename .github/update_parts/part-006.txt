@@ -1,0 +1,368 @@
+view_links.py
+@@ -0,0 +1,51 @@
++"""Opaque capability helpers for manual Senior review links.
++
++The raw token is shown only to the user who creates the link. The database stores
++only a domain-separated SHA-256 digest, so a database leak does not reveal active
++review URLs.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import re
++import secrets
++from urllib.parse import urlencode, urlsplit, urlunsplit
++
++_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43,86}$")
++
++
++def generate_review_token(num_bytes: int = 32) -> str:
++    if isinstance(num_bytes, bool) or not isinstance(num_bytes, int):
++        raise TypeError("num_bytes must be an integer.")
++    if not 32 <= num_bytes <= 64:
++        raise ValueError("num_bytes must be between 32 and 64.")
++    return secrets.token_urlsafe(num_bytes)
++
++
++def normalize_review_token(token: str) -> str:
++    if not isinstance(token, str):
++        raise TypeError("review token must be text.")
++    clean = token.strip()
++    if _TOKEN_RE.fullmatch(clean) is None:
++        raise ValueError("The Senior review link is invalid.")
++    return clean
++
++
++def hash_review_token(token: str) -> str:
++    clean = normalize_review_token(token)
++    return hashlib.sha256(
++        b"senior-review-link\x00" + clean.encode("ascii")
++    ).hexdigest()
++
++
++def build_review_url(public_base_url: str, token: str) -> str:
++    clean_token = normalize_review_token(token)
++    if not isinstance(public_base_url, str):
++        raise TypeError("public_base_url must be text.")
++    base = public_base_url.strip().rstrip("/")
++    parsed = urlsplit(base)
++    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
++        raise ValueError("APP_PUBLIC_BASE_URL must be a complete http(s) URL.")
++    query = urlencode({"review": clean_token})
++    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", query, ""))
+diff --git a/tests/test_campaign_store.py b/tests/test_campaign_store.py
+index 6b84be8..d2cb0b5 100644
+--- a/tests/test_campaign_store.py
++++ b/tests/test_campaign_store.py
+@@ -170,7 +170,7 @@ class CampaignStoreTests(unittest.TestCase):
+             self.assertIn("approvals", tables)
+             self.assertTrue({
+                 "review_recipients", "review_requests", "review_sessions",
+-                "notification_outbox",
++                "notification_outbox", "senior_review_links",
+             }.issubset(tables))
+             calendar_columns = {
+                 row[1] for row in connection.execute("PRAGMA table_info(calendar_versions)")
+diff --git a/tests/test_revision_logic.py b/tests/test_revision_logic.py
+index 634d40c..b230c15 100644
+--- a/tests/test_revision_logic.py
++++ b/tests/test_revision_logic.py
+@@ -1,9 +1,13 @@
+ import unittest
+ 
+ from revision_logic import (
++    REVISION_FIELDS,
++    build_field_revision_prompt,
+     build_selected_post_revision_prompt,
+     list_reviewable_posts,
++    merge_revised_fields,
+     merge_revised_post,
++    normalize_revision_fields,
+ )
+ 
+ 
+@@ -49,8 +53,7 @@ class RevisionLogicTests(unittest.TestCase):
+             campaign_intake={"goal": "Lead generation", "language": "English"},
+         )
+         self.assertIn("Make the CTA stronger.", prompt)
+-        self.assertIn("Keep Date, Platform, Pillar, and Format unchanged", prompt)
+-        self.assertIn("exactly one content row", prompt)
++        self.assertIn("exactly 1 content row(s)", prompt)
+ 
+         with self.assertRaises(ValueError):
+             build_selected_post_revision_prompt(
+@@ -59,6 +62,58 @@ class RevisionLogicTests(unittest.TestCase):
+                 senior_feedback="",
+             )
+ 
++    def test_seo_only_merge_changes_only_seo_field(self):
++        revised = [[
++            "wrong date", "wrong platform", "wrong pillar", "wrong format",
++            "wrong idea", "faridabad first home buyer", "wrong cta",
++        ]]
++        merged = merge_revised_fields(
++            ROWS,
++            target_row_indices=[1],
++            revised_rows=revised,
++            fields_to_change=["SEO Keyword Focus"],
++        )
++        self.assertEqual(merged[1][:5], ROWS[1][:5])
++        self.assertEqual(merged[1][5], "faridabad first home buyer")
++        self.assertEqual(merged[1][6], ROWS[1][6])
++        self.assertEqual(merged[2], ROWS[2])
++
++    def test_whole_calendar_cta_merge_preserves_all_other_fields(self):
++        revised = [
++            [*ROWS[1][:6], "Lead CTA 1"],
++            [*ROWS[2][:6], "Lead CTA 2"],
++        ]
++        merged = merge_revised_fields(
++            ROWS,
++            target_row_indices=[1, 2],
++            revised_rows=revised,
++            fields_to_change=["CTA"],
++        )
++        self.assertEqual(merged[1][:6], ROWS[1][:6])
++        self.assertEqual(merged[2][:6], ROWS[2][:6])
++        self.assertEqual(merged[1][6], "Lead CTA 1")
++        self.assertEqual(merged[2][6], "Lead CTA 2")
++
++    def test_field_prompt_includes_senior_and_team_instructions(self):
++        prompt = build_field_revision_prompt(
++            headers=HEADERS,
++            current_rows=[ROWS[1]],
++            fields_to_change=["SEO Keyword Focus"],
++            senior_feedback="Use buyer-intent keywords only.",
++            user_instructions="Include Sector 88 where relevant.",
++        )
++        self.assertIn("SEO Keyword Focus", prompt)
++        self.assertIn("Use buyer-intent keywords only.", prompt)
++        self.assertIn("Include Sector 88 where relevant.", prompt)
++        self.assertIn("Change ONLY these field(s): SEO Keyword Focus", prompt)
++
++    def test_revision_fields_are_restricted(self):
++        self.assertEqual(normalize_revision_fields(list(REVISION_FIELDS)), REVISION_FIELDS)
++        with self.assertRaises(ValueError):
++            normalize_revision_fields(["Platform"])
++        with self.assertRaises(ValueError):
++            normalize_revision_fields([])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_senior_review_links.py b/tests/test_senior_review_links.py
+new file mode 100644
+index 0000000..440413c
+--- /dev/null
++++ b/tests/test_senior_review_links.py
+@@ -0,0 +1,209 @@
++import tempfile
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++
++import pytest
++
++from campaign_store import CampaignStore, StoreConflict
++from senior_review_links import (
++    build_review_url,
++    generate_review_token,
++    hash_review_token,
++)
++
++HEADERS = [
++    "Date",
++    "Platform",
++    "Pillar",
++    "Format",
++    "Content Idea",
++    "SEO Keyword Focus",
++    "CTA",
++]
++ROWS = [[
++    "Mon, Aug 24",
++    "Instagram",
++    "Educational",
++    "Image",
++    "Helpful idea",
++    "useful keyword",
++    "Learn more",
++]]
++
++
++def future_iso(hours=2):
++    return (
++        datetime.now(timezone.utc) + timedelta(hours=hours)
++    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
++
++
++def make_review_ready_store():
++    temp = tempfile.TemporaryDirectory()
++    store = CampaignStore(Path(temp.name) / "campaigns.sqlite3")
++    client = store.create_or_update_client("ABC Realty", {"industry": "Real Estate"})
++    campaign = store.create_campaign(
++        client["id"], {"goal": "Leads"}, request_id="request-review-link"
++    )
++    version = store.complete_generation(campaign["id"], HEADERS, ROWS)
++    return temp, store, client, campaign, version
++
++
++def test_token_is_opaque_hashed_and_url_safe():
++    token = generate_review_token()
++    assert len(token) >= 43
++    assert len(hash_review_token(token)) == 64
++    url = build_review_url("https://marketing.example.com", token)
++    assert url.startswith("https://marketing.example.com/")
++    assert "?review=" in url
++    assert token in url
++
++
++def test_create_open_and_approve_review_link():
++    temp, store, _client, campaign, version = make_review_ready_store()
++    try:
++        token = generate_review_token()
++        token_hash = hash_review_token(token)
++        created = store.create_senior_review_link(
++            campaign["id"], version["id"], token_hash, future_iso()
++        )
++        assert created["status"] == "pending"
++        assert "token_hash" not in created
++
++        bundle = store.get_senior_review_link_bundle(token_hash, mark_opened=True)
++        assert bundle["campaign"]["id"] == campaign["id"]
++        assert bundle["calendar"]["id"] == version["id"]
++        assert bundle["link"]["opened_at"] is not None
++
++        result = store.decide_senior_review_link(
++            token_hash,
++            "approved",
++            "Senior Reviewer",
++            "senior@example.com",
++        )
++        assert result["campaign"]["status"] == "fully_approved"
++        assert result["approval"]["role"] == "senior"
++        assert result["approval"]["decision"] == "approved"
++        assert result["link"]["status"] == "decided"
++
++        with pytest.raises(StoreConflict):
++            store.get_senior_review_link_bundle(token_hash)
++    finally:
++        store.close()
++        temp.cleanup()
++
++
++def test_reject_requires_feedback_and_moves_to_revision_required():
++    temp, store, _client, campaign, version = make_review_ready_store()
++    try:
++        token_hash = hash_review_token(generate_review_token())
++        store.create_senior_review_link(
++            campaign["id"], version["id"], token_hash, future_iso()
++        )
++        with pytest.raises(ValueError):
++            store.decide_senior_review_link(
++                token_hash,
++                "rejected",
++                "Senior Reviewer",
++                "senior@example.com",
++                "",
++            )
++        result = store.decide_senior_review_link(
++            token_hash,
++            "rejected",
++            "Senior Reviewer",
++            "senior@example.com",
++            "Replace only the SEO keywords with buyer-intent keywords.",
++            change_request={
++                "scope": "specific_post",
++                "post_number": 1,
++                "row_index": 0,
++                "fields": ["SEO Keyword Focus"],
++            },
++        )
++        assert result["campaign"]["status"] == "revision_required"
++        assert result["approval"]["feedback"] == (
++            "Replace only the SEO keywords with buyer-intent keywords."
++        )
++        assert result["change_request"]["scope"] == "specific_post"
++        assert result["change_request"]["post_number"] == 1
++        assert result["change_request"]["fields"] == ["SEO Keyword Focus"]
++        stored = store.get_senior_change_request(campaign["id"], version["id"])
++        assert stored["id"] == result["change_request"]["id"]
++    finally:
++        store.close()
++        temp.cleanup()
++
++
++def test_new_link_revokes_previous_link_for_same_version():
++    temp, store, _client, campaign, version = make_review_ready_store()
++    try:
++        first_hash = hash_review_token(generate_review_token())
++        second_hash = hash_review_token(generate_review_token())
++        store.create_senior_review_link(
++            campaign["id"], version["id"], first_hash, future_iso()
++        )
++        store.create_senior_review_link(
++            campaign["id"], version["id"], second_hash, future_iso()
++        )
++        with pytest.raises(StoreConflict):
++            store.get_senior_review_link_bundle(first_hash)
++        assert store.get_senior_review_link_bundle(second_hash)["link"]["status"] == "pending"
++    finally:
++        store.close()
++        temp.cleanup()
++
++
++def test_whole_calendar_change_request_is_structured():
++    temp, store, _client, campaign, version = make_review_ready_store()
++    try:
++        token_hash = hash_review_token(generate_review_token())
++        store.create_senior_review_link(
++            campaign["id"], version["id"], token_hash, future_iso()
++        )
++        result = store.decide_senior_review_link(
++            token_hash,
++            "rejected",
++            "Senior Reviewer",
++            "senior@example.com",
++            "Make every CTA lead-generation focused.",
++            change_request={
++                "scope": "whole_calendar",
++                "post_number": None,
++                "row_index": None,
++                "fields": ["CTA"],
++            },
++        )
++        request = result["change_request"]
++        assert request["scope"] == "whole_calendar"
++        assert request["post_number"] is None
++        assert request["row_index"] is None
++        assert request["fields"] == ["CTA"]
++    finally:
++        store.close()
++        temp.cleanup()
++
++
++def test_structured_change_rejects_unsupported_fields():
++    temp, store, _client, campaign, version = make_review_ready_store()
++    try:
++        token_hash = hash_review_token(generate_review_token())
++        store.create_senior_review_link(
++            campaign["id"], version["id"], token_hash, future_iso()
++        )
++        with pytest.raises(ValueError):
++            store.decide_senior_review_link(
++                token_hash,
++                "rejected",
++                "Senior Reviewer",
++                "senior@example.com",
++                "Change platform.",
++                change_request={
++                    "scope": "specific_post",
++                    "post_number": 1,
++                    "row_index": 0,
++                    "fields": ["Platform"],
++                },
++            )
++    finally:
++        store.close()
++        temp.cleanup()
