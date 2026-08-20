@@ -1,0 +1,17 @@
+campaign_status(
+-                                    campaign_id,
+-                                    "generating",
+-                                    event_type="selected_post_revision_started",
+-                                    details={
+-                                        "source_calendar_version_id": latest_calendar["id"],
+-                                        "source_post_number": selected_post["post_number"],
+-                                        "request_id": revision_result.request_id,
+-                                    },
+-                                )
+-                                new_version = campaign_store.complete_generation(
+-                                    campaign_id,
+-                                    latest_calendar["headers"],
+-                                    revised_calendar_rows,
+-                                    client_metadata=latest_calendar.get(
+-                                        "client_metadata"
+-                
