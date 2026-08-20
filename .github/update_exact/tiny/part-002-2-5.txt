@@ -1,0 +1,18 @@
+-                            )
+-                            revised_headers, revised_rows = parse_markdown_table(
+-                                revision_result.content
+-                            )
+-                            if revised_headers != CONTENT_CALENDAR_HEADERS:
+-                                raise ValueError(
+-                                    "The regenerated post returned an unexpected header."
+-                                )
+-                            if len(revised_rows) != 1:
+-                                raise ValueError(
+-                                    "The regenerated response must contain exactly one post."
+-                                )
+-                            revised_calendar_rows = merge_revised_post(
+-                                latest_calendar["rows"],
+-                                row_index=selected_post["row_index"],
+-                                revised_row=revised_rows[0],
+-                            )
+-           
