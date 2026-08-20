@@ -1,0 +1,16 @@
+           campaign_intake=(campaign_record or {}).get("intake", {}),
+                             )
+-                            revision_generation_metadata.update(
+-                                {
+-                                    "request_id": revision_result.request_id,
+-                                    "provider": revision_result.provider,
+-                                    "model": revision_result.model,
+-                                    "finish_reason": revision_result.finish_reason,
+-                                    "usage": dict(revision_result.usage or {}),
+-                                    "revision_type": "selected_post",
+-                                    "source_calendar_version_id": latest_calendar["id"],
+-                                    "source_post_number": selected_post["post_number"],
+-                                }
+-                            )
+-                            try:
+-                                campaign_store.transition_
