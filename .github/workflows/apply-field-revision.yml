@@ -6,6 +6,9 @@ on:
       - feature/senior-review-links-field-revisions
     paths:
       - .github/workflows/apply-field-revision.yml
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
