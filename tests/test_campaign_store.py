@@ -170,7 +170,7 @@ class CampaignStoreTests(unittest.TestCase):
             self.assertIn("approvals", tables)
             self.assertTrue({
                 "review_recipients", "review_requests", "review_sessions",
-                "notification_outbox",
+                "notification_outbox", "senior_review_links",
             }.issubset(tables))
             calendar_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(calendar_versions)")
