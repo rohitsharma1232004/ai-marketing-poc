@@ -1,0 +1,56 @@
+name: Apply field revision update
+
+on:
+  push:
+    branches:
+      - feature/senior-review-links-field-revisions
+    paths:
+      - .github/workflows/apply-field-revision.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/senior-review-links-field-revisions
+          fetch-depth: 0
+
+      - name: Assemble and apply tested patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/update_parts/part-*.txt > /tmp/senior-field-revision.patch
+          git apply --check /tmp/senior-field-revision.patch
+          git apply /tmp/senior-field-revision.patch
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Compile and test
+        run: |
+          python -m py_compile app.py campaign_store.py revision_logic.py senior_review_links.py
+          PYTHONPATH=. pytest -q tests/test_campaign_store.py tests/test_revision_logic.py tests/test_senior_review_links.py tests/test_generation_providers.py
+
+      - name: Commit actual feature and remove staging files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .github/update_parts
+          rm .github/workflows/apply-field-revision.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- .gitignore .streamlit/secrets.toml.example APPROVAL_WORKFLOW.md DEVELOPMENT_ROADMAP.md app.py campaign_store.py revision_logic.py senior_review_links.py tests/test_campaign_store.py tests/test_revision_logic.py tests/test_senior_review_links.py .github/update_parts .github/workflows/apply-field-revision.yml
+          git commit -m "Add secure Senior review links and field-level revisions"
+          git push origin HEAD:feature/senior-review-links-field-revisions
