@@ -1,0 +1,323 @@
+                                      n8n_webhook_url=revision_n8n_url,
++                                        n8n_webhook_secret=revision_n8n_secret,
++                                        campaign_id=campaign_id,
++                                        request_id=revision_request_id,
++                                    )
++                                    revised_headers, revised_rows = parse_markdown_table(
++                                        revision_result.content
++                                    )
++                                    if revised_headers != CONTENT_CALENDAR_HEADERS:
++                                        raise ValueError(
++                                            "The regenerated response returned an unexpected header."
++                                        )
++                                    if len(revised_rows) != len(target_posts):
++                                        raise ValueError(
++                                            "The regenerated row count does not match the requested scope."
++                                        )
++                                    revised_calendar_rows = merge_revised_fields(
++                                        latest_calendar["rows"],
++                                        target_row_indices=[
++                                            item["row_index"] for item in target_posts
++                                        ],
++                                        revised_rows=revised_rows,
++                                        fields_to_change=fields_to_change,
++                                    )
++                                    validate_calendar_for_export(
++                                        latest_calendar["headers"],
++                                        revised_calendar_rows,
++                                        (campaign_record or {}).get("intake", {}).get(
++                                            "schedule", []
++                                        ),
+                                     )
+-                                    if current_campaign.get("status") == "generating":
++                                except (
++                                    GenerationProviderError, TypeError, ValueError
++                                ) as revision_error:
++                                    st.error(
++                                        "Requested fields could not be regenerated: "
++                                        f"{revision_error}"
++                                    )
++                                else:
++                                    revision_generation_metadata = dict(
++                                        latest_calendar.get("generation_metadata") or {}
++                                    )
++                                    revision_generation_metadata.update(
++                                        {
++                                            "request_id": revision_result.request_id,
++                                            "provider": revision_result.provider,
++                                            "model": revision_result.model,
++                                            "finish_reason": revision_result.finish_reason,
++                                            "usage": dict(revision_result.usage or {}),
++                                            "revision_type": "field_level",
++                                            "source_calendar_version_id": latest_calendar["id"],
++                                            "senior_change_request_id": structured_change["id"],
++                                            "change_scope": change_scope,
++                                            "change_fields": fields_to_change,
++                                            "source_post_numbers": [
++                                                item["post_number"] for item in target_posts
++                                            ],
++                                            "team_additional_instructions": (
++                                                user_additional_instructions.strip()
++                                            ),
++                                        }
++                                    )
++                                    try:
+                                         campaign_store.transition_campaign_status(
+                                             campaign_id,
+-                                            "generation_failed",
+-                                            event_type="selected_post_revision_save_failed",
++                                            "generating",
++                                            event_type="field_revision_started",
+                                             details={
+-                                                "request_id": revision_result.request_id
++                                                "source_calendar_version_id": latest_calendar["id"],
++                                                "senior_change_request_id": structured_change["id"],
++                                                "change_scope": change_scope,
++                                                "change_fields": fields_to_change,
++                                                "source_post_numbers": [
++                                                    item["post_number"] for item in target_posts
++                                                ],
++                                                "request_id": revision_result.request_id,
++                                            },
++                                        )
++                                        new_version = campaign_store.complete_generation(
++                                            campaign_id,
++                                            latest_calendar["headers"],
++                                            revised_calendar_rows,
++                                            client_metadata=latest_calendar.get(
++                                                "client_metadata"
++                                            ),
++                                            generation_metadata=revision_generation_metadata,
++                                        )
++                                        campaign_store.append_event(
++                                            campaign_id,
++                                            "requested_fields_regenerated",
++                                            {
++                                                "source_calendar_version_id": latest_calendar["id"],
++                                                "new_calendar_version_id": new_version["id"],
++                                                "senior_change_request_id": structured_change["id"],
++                                                "change_scope": change_scope,
++                                                "change_fields": fields_to_change,
++                                                "request_id": revision_result.request_id,
+                                             },
+                                         )
+-                                except PERSISTENCE_EXCEPTIONS:
+-                                    pass
+-                                st.error(
+-                                    "The revised post was generated but its new calendar "
+-                                    f"version could not be saved: {revision_save_error}"
+-                                )
+-                            else:
+-                                load_campaign_into_session(campaign_store, campaign_id)
+-                                st.session_state["status"] = "pending_senior_review"
+-                                st.success(
+-                                    f"Post {selected_post['post_number']} regenerated. "
+-                                    f"Calendar Version {new_version['version']} is now "
+-                                    "pending Senior approval again."
+-                                )
+-                                st.rerun()
++                                    except PERSISTENCE_EXCEPTIONS as revision_save_error:
++                                        try:
++                                            current_campaign = campaign_store.get_campaign(
++                                                campaign_id
++                                            )
++                                            if current_campaign.get("status") == "generating":
++                                                campaign_store.transition_campaign_status(
++                                                    campaign_id,
++                                                    "generation_failed",
++                                                    event_type="field_revision_save_failed",
++                                                    details={
++                                                        "request_id": revision_result.request_id
++                                                    },
++                                                )
++                                        except PERSISTENCE_EXCEPTIONS:
++                                            pass
++                                        st.error(
++                                            "The revision was generated but the new calendar "
++                                            f"version could not be saved: {revision_save_error}"
++                                        )
++                                    else:
++                                        load_campaign_into_session(
++                                            campaign_store, campaign_id
++                                        )
++                                        st.session_state["status"] = "pending_senior_review"
++                                        st.success(
++                                            f"Requested fields regenerated. Calendar Version "
++                                            f"{new_version['version']} is now pending Senior "
++                                            "approval again."
++                                        )
++                                        st.rerun()
++            else:
++                st.markdown("### Legacy Change Request")
++                st.caption(
++                    "This rejection was created before field-level requests were stored. "
++                    "Choose the affected post manually; all three content fields will be revised."
++                )
++                selected_label = st.selectbox(
++                    "Post to regenerate",
++                    [item["label"] for item in reviewable_posts],
++                    key=f"legacy_revision_post_{latest_calendar['id']}",
++                )
++                selected_post = next(
++                    item for item in reviewable_posts if item["label"] == selected_label
++                )
++                st.info(
++                    "For this older request, create a fresh Senior review link if you want "
++                    "field-specific control such as SEO Keywords only."
++                )
+     elif campaign_store is not None and campaign_id and latest_calendar is not None:
+         st.warning("Status: Pending Senior Review — Excel download is locked.")
+-        with st.form(f"senior_review_form_{latest_calendar['id']}"):
+-            st.markdown("### Senior Review")
+-            senior_name = st.text_input("Senior Reviewer Name", max_chars=200)
+-            senior_email = st.text_input("Senior Reviewer Email", max_chars=320)
+-            senior_feedback = st.text_area(
+-                "Feedback (required when requesting changes)",
+-                max_chars=5000,
+-            )
+-            approve_col, reject_col = st.columns(2)
+-            with approve_col:
+-                senior_approve = st.form_submit_button(
+-                    "Approve Calendar", use_container_width=True
++        st.markdown("### Send for Senior Approval")
++        st.caption(
++            "Create a secure, version-bound link. Share only this link with the Senior; "
++            "the main marketing dashboard is not shown when it is opened."
++        )
++        link_session_key = f"senior_review_url_{latest_calendar['id']}"
++        if st.button(
++            "Create Senior Review Link",
++            use_container_width=True,
++            key=f"create_senior_review_link_{latest_calendar['id']}",
++        ):
++            try:
++                ttl_hours = review_link_ttl_hours()
++                raw_token = generate_review_token()
++                expires_at = (
++                    datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
++                ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
++                campaign_store.create_senior_review_link(
++                    campaign_id,
++                    latest_calendar["id"],
++                    hash_review_token(raw_token),
++                    expires_at,
+                 )
+-            with reject_col:
+-                senior_reject = st.form_submit_button(
+-                    "Request Changes", use_container_width=True
++                review_url = build_review_url(
++                    configured_public_base_url(), raw_token
+                 )
+-
+-        if senior_approve or senior_reject:
+-            clean_name = senior_name.strip()
+-            clean_email = senior_email.strip()
+-            clean_feedback = senior_feedback.strip()
+-            if not clean_name or not clean_email:
+-                st.error("Senior reviewer name and email are required.")
+-            elif senior_reject and not clean_feedback:
+-                st.error("Please add feedback before requesting changes.")
++            except PERSISTENCE_EXCEPTIONS as link_error:
++                st.error(f"Senior review link could not be created: {link_error}")
+             else:
+-                decision = "approved" if senior_approve else "rejected"
+-                try:
+-                    campaign_store.record_approval(
+-                        campaign_id,
+-                        latest_calendar["id"],
+-                        "senior",
+-                        decision,
+-                        clean_name,
+-                        clean_email,
+-                        clean_feedback,
+-                        senior_is_final=True,
+-                    )
+-                except PERSISTENCE_EXCEPTIONS as approval_error:
+-                    st.error(f"Senior decision could not be saved: {approval_error}")
+-                else:
+-                    st.session_state.pop("excel_file", None)
+-                    st.rerun()
++                st.session_state[link_session_key] = review_url
++                st.success(
++                    f"Senior review link created. It expires in {ttl_hours} hours. "
++                    "Creating another link for this version will revoke the previous one."
++                )
++
++        review_url = st.session_state.get(link_session_key)
++        if review_url:
++            st.markdown("**Senior Review Link**")
++            st.code(review_url, language=None)
++            st.link_button(
++                "Open Senior Review Page",
++                review_url,
++                use_container_width=True,
++            )
++            if "localhost" in review_url or "127.0.0.1" in review_url:
++                st.info(
++                    "Local test link: this opens only on this computer. After deployment, "
++                    "set APP_PUBLIC_BASE_URL to the public HTTPS app URL and the same flow "
++                    "will work on the Senior's phone or laptop."
++                )
++
++        if st.button(
++            "Refresh Senior Review Status",
++            use_container_width=True,
++            key=f"refresh_senior_review_status_{latest_calendar['id']}",
++        ):
++            st.rerun()
+ 
+     if st.button(
+         "Clear Current View",
+diff --git a/campaign_store.py b/campaign_store.py
+index 72318f4..26b6c1b 100644
+--- a/campaign_store.py
++++ b/campaign_store.py
+@@ -22,7 +22,7 @@ from typing import Any, Iterator
+ from uuid import UUID, uuid4
+ 
+ 
+-SCHEMA_VERSION = 4
++SCHEMA_VERSION = 6
+ CAMPAIGN_STATUSES = frozenset(
+     {
+         "generating",
+@@ -62,6 +62,9 @@ MAX_JSON_CHARS = 1_000_000
+ MAX_APPROVER_NAME_CHARS = 200
+ MAX_APPROVER_EMAIL_CHARS = 320
+ MAX_APPROVAL_FEEDBACK_CHARS = 5_000
++MAX_REVISION_DESCRIPTION_CHARS = 5_000
++REVISION_SCOPES = frozenset({"specific_post", "whole_calendar"})
++REVISION_FIELDS = frozenset({"Content Idea", "SEO Keyword Focus", "CTA"})
+ MAX_RECIPIENT_NAME_CHARS = 200
+ MAX_MANUAL_SHARE_NOTE_CHARS = 2_000
+ MAX_DEDUPE_KEY_CHARS = 300
+@@ -1307,6 +1310,409 @@ class CampaignStore:
+             "outbox": _notification_outbox_from_row(outbox_row) if outbox_row else None,
+         }
+ 
++    def create_senior_review_link(
++        self,
++        campaign_id: str,
++        calendar_version_id: str,
++        token_hash: str,
++        expires_at: str,
++    ) -> dict[str, Any]:
++        """Create one revocable, version-bound Senior share link.
++
++        Only a SHA-256 hash of the opaque capability token is stored. Creating a
++        new link revokes any still-pending link for the same calendar version.
++        """
++
++        clean_campaign_id = _canonical_uuid(campaign_id, "campaign_id")
++        clean_version_id = _canonical_uuid(calendar_version_id, "calendar_version_id")
++        clean_hash = _sha256_hash(token_hash, "token_hash")
++        clean_expires_at = _future_utc_timestamp(expires_at, "expires_at")
++        now = _utc_now()
++        link_id = str(uuid4())
++
++        with self._connection() as connection:
++            connection.execute("BEGIN IMMEDIATE")
++            campaign = connection.execute(
++                "SELECT * FROM campaigns WHERE id=?", (clean_campaign_id,)
++            ).fetchone()
++            if ca
