@@ -436,6 +436,23 @@ class CampaignStoreTests(unittest.TestCase):
         )
         self.assertEqual(retried["status"], "generating")
 
+    def test_single_senior_approval_can_be_terminal_for_active_poc(self):
+        _, campaign = self.create_client_and_campaign()
+        version = self.store.complete_generation(campaign["id"], HEADERS, ROWS)
+        approval = self.store.record_approval(
+            campaign["id"],
+            version["id"],
+            "senior",
+            "approved",
+            "Senior",
+            "senior@example.com",
+            senior_is_final=True,
+        )
+        self.assertEqual(approval["decision"], "approved")
+        self.assertEqual(
+            self.store.get_campaign(campaign["id"])["status"], "fully_approved"
+        )
+
     def test_complete_generation_saves_and_transitions_atomically(self):
         _, campaign = self.create_client_and_campaign()
         version = self.store.complete_generation(campaign["id"], HEADERS, ROWS)

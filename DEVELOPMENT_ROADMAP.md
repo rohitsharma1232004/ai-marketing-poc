@@ -40,8 +40,8 @@ Milestone 2A completed locally:
 - Added SQLite clients, campaigns, immutable calendar versions and workflow events.
 - Correlated every n8n request with persisted campaign and request UUIDs.
 - Added atomic transition from generation to pending_senior_review.
-- Added sequential senior then client decisions, rejection feedback, immutable
-  version/hash-bound approval records, and a fully_approved export gate.
+- Preserved immutable version/hash-bound approval records while the active POC now
+  uses one terminal Senior approval before Excel export.
 - Added full Campaign ID lookup and visible recent history; clearing the current
   view never deletes records.
 - Kept uploaded document bytes/text and all credentials out of the database.
@@ -78,17 +78,23 @@ Status: planned
 - Automatic brand, claim, duplication and platform QA.
 - Freeze and hash each content-package version.
 
-## Milestone 5 — two-stage approval
+## Milestone 5 — Senior approval and revision
 
 Status: **secure-link development POC complete; production hardening planned**
 
-- Local Streamlit now enforces senior approval before client approval and records
-  names, emails, decisions, feedback, timestamps, version IDs, and content hashes.
-- Local final Excel creation is allowed only after fully_approved.
-- Signed, expiring senior/client links and the review portal are implemented.
-- Add OTP/login/SSO so a forwarded bearer link is not sufficient identity proof.
-- Add an edit/revision workflow where every new version invalidates both prior
-  approvals and notifies the next reviewer.
+- Active Streamlit uses one terminal Senior approval and records names, emails,
+  decisions, feedback, timestamps, version IDs, and content hashes.
+- Local final Excel creation is allowed only after the latest version has matching
+  Senior approval.
+- Selected-post regeneration creates a new version and requires fresh Senior review.
+- Archived signed-link infrastructure remains available as reference for the next
+  secure shareable Senior Review URL.
+- Add OTP/login/SSO before production so a forwarded bearer link is not sufficient
+  identity proof.
+- Selected-post revision is now implemented: Senior feedback can regenerate one
+  chosen post into a new immutable calendar version, automatically requiring fresh
+  Senior approval.
+- Add a secure shareable Senior Review URL for deployed environments.
 - n8n sends notifications and reacts to decisions; PostgreSQL remains the
   approval authority.
 

@@ -517,6 +517,8 @@ class CampaignStore:
         approver_name: str,
         approver_email: str,
         feedback: str = "",
+        *,
+        senior_is_final: bool = False,
     ) -> dict[str, Any]:
         """Append one version-bound decision and advance review atomically.
 
@@ -525,6 +527,9 @@ class CampaignStore:
         and the stored digest is recomputed before every decision so a modified
         calendar record cannot be approved under its original hash.
         """
+
+        if not isinstance(senior_is_final, bool):
+            raise TypeError("senior_is_final must be a boolean.")
 
         clean_campaign_id = _canonical_uuid(campaign_id, "campaign_id")
         clean_version_id = _canonical_uuid(
@@ -616,11 +621,15 @@ class CampaignStore:
                         "A senior decision is only allowed during senior review."
                     )
                 new_status = (
-                    "pending_client_review"
+                    ("fully_approved" if senior_is_final else "pending_client_review")
                     if clean_decision == "approved"
                     else "revision_required"
                 )
             else:
+                if senior_is_final:
+                    raise ValueError(
+                        "senior_is_final can only be used for a senior decision."
+                    )
                 if old_status != "pending_client_review":
                     raise InvalidStatusTransition(
                         "A client decision requires prior senior approval."
