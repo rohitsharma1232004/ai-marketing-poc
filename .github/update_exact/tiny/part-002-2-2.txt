@@ -1,0 +1,18 @@
+
+-                    revision_prompt = build_selected_post_revision_prompt(
+-                        headers=latest_calendar["headers"],
+-                        current_row=selected_post["row"],
+-                        senior_feedback=senior_feedback_text,
+-                        client_metadata=latest_calendar.get("client_metadata"),
+-                        campaign_intake=(campaign_record or {}).get("intake", {}),
++                    scope_text = (
++                        f"Post {target_posts[0]['post_number']}"
++                        if change_scope == "specific_post"
++                        else "Whole Calendar"
++                    )
++                    st.markdown("### Regenerate Requested Fields")
++                    st.markdown(f"**Scope:** {scope_text}")
++                    st.markdown(f"**Fields:** {', '.join(fields_to_change)}")
++                    st.caption(
++                        "Only the Senior-selected fields will change. All other values are "
++       
