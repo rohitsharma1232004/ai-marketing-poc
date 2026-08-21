@@ -1,4 +1,5 @@
 from creative_studio import (
+    MAX_CREATIVE_GENERATION_PROMPT_CHARS,
     build_branded_design_prompt,
     build_design_revision_prompt,
     provider_capability,
@@ -55,6 +56,7 @@ def test_branded_prompt_keeps_approved_copy_and_brand_constraints():
     assert "#14213D" in prompt
     assert "Montserrat" in prompt
     assert "Never invent, redraw, or imitate a client logo" in prompt
+    assert len(prompt) <= MAX_CREATIVE_GENERATION_PROMPT_CHARS
 
 
 def test_visual_only_mode_explicitly_blocks_copy_rendering():
@@ -80,6 +82,20 @@ def test_revision_prompt_preserves_content_and_scopes_changes():
     assert "simplify the background" in prompt
     assert "Save this checklist" in prompt
     assert "Change only what is necessary" in prompt
+
+
+def test_revision_prompt_clips_only_old_prompt_when_near_limit():
+    prompt = build_design_revision_prompt(
+        original_prompt="OLD-DIRECTION " * 2000,
+        senior_feedback="Make the logo area more visible and simplify the background.",
+        change_fields=["Logo / Branding", "Image / Visual"],
+        approved_post=POST,
+        brand_kit=KIT,
+    )
+    assert len(prompt) <= MAX_CREATIVE_GENERATION_PROMPT_CHARS
+    assert "Save this checklist" in prompt
+    assert "Make the logo area more visible" in prompt
+    assert "Earlier creative prompt clipped" in prompt
 
 
 def test_recommended_ratios_match_social_formats():
