@@ -119,6 +119,17 @@ def test_creative_versions_are_append_only_and_latest_is_returned():
         temp.cleanup()
 
 
+def test_duplicate_latest_creative_is_rejected():
+    temp, store, campaign, version = make_store()
+    try:
+        save_asset(store, campaign, version, suffix="same")
+        with pytest.raises(StoreConflict, match="exact creative file"):
+            save_asset(store, campaign, version, suffix="same")
+    finally:
+        store.close()
+        temp.cleanup()
+
+
 def test_design_review_link_rejects_old_creative_after_new_version_exists():
     temp, store, campaign, version = make_store()
     try:
@@ -127,6 +138,27 @@ def test_design_review_link_rejects_old_creative_after_new_version_exists():
         token_hash = hash_design_review_token(generate_review_token())
         with pytest.raises(StoreConflict, match="latest creative"):
             store.create_design_review_link(first["id"], token_hash, future_iso())
+    finally:
+        store.close()
+        temp.cleanup()
+
+
+def test_new_creative_revokes_pending_review_link_for_prior_version():
+    temp, store, campaign, version = make_store()
+    try:
+        first = save_asset(store, campaign, version, suffix="one")
+        token_hash = hash_design_review_token(generate_review_token())
+        store.create_design_review_link(first["id"], token_hash, future_iso())
+        assert store.list_latest_creative_assets(campaign["id"], version["id"])[0][
+            "active_review_link"
+        ] is True
+
+        save_asset(store, campaign, version, suffix="two")
+        with pytest.raises(StoreConflict, match="no longer active"):
+            store.get_design_review_link_bundle(token_hash)
+        latest = store.list_latest_creative_assets(campaign["id"], version["id"])[0]
+        assert latest["asset_version"] == 2
+        assert latest["active_review_link"] is False
     finally:
         store.close()
         temp.cleanup()
@@ -154,6 +186,10 @@ def test_design_rejection_is_bound_to_asset_and_new_upload_resets_latest_status(
         assert result["approval"]["change_fields"] == ["Logo / Branding"]
         latest = store.list_latest_creative_assets(campaign["id"], version["id"])[0]
         assert latest["latest_decision"] == "rejected"
+        assert latest["design_approver_name"] == "Senior Reviewer"
+        assert latest["design_approver_email"] == "senior@example.com"
+        assert latest["design_decided_at"]
+        assert latest["design_feedback"].startswith("Increase logo")
 
         second = save_asset(store, campaign, version, suffix="two")
         latest = store.list_latest_creative_assets(campaign["id"], version["id"])[0]
@@ -179,6 +215,9 @@ def test_design_approval_consumes_link_and_marks_latest_asset_approved():
         assert result["approval"]["decision"] == "approved"
         latest = store.list_latest_creative_assets(campaign["id"], version["id"])[0]
         assert latest["latest_decision"] == "approved"
+        assert latest["design_approver_name"] == "Senior Reviewer"
+        assert latest["design_approver_email"] == "senior@example.com"
+        assert latest["design_decided_at"]
         assert latest["active_review_link"] is False
         with pytest.raises(StoreConflict):
             store.get_design_review_link_bundle(token_hash)
@@ -211,6 +250,26 @@ def test_design_rejection_requires_feedback_and_change_field():
                 "Change the layout.",
                 change_fields=[],
             )
+    finally:
+        store.close()
+        temp.cleanup()
+
+
+def test_reel_scene_change_field_is_supported():
+    temp, store, campaign, version = make_store()
+    try:
+        asset = save_asset(store, campaign, version)
+        token_hash = hash_design_review_token(generate_review_token())
+        store.create_design_review_link(asset["id"], token_hash, future_iso())
+        result = store.decide_design_review_link(
+            token_hash,
+            "rejected",
+            "Senior Reviewer",
+            "senior@example.com",
+            "Simplify the visual sequence and B-roll.",
+            change_fields=["Reel Scenes / B-roll"],
+        )
+        assert result["approval"]["change_fields"] == ["Reel Scenes / B-roll"]
     finally:
         store.close()
         temp.cleanup()
