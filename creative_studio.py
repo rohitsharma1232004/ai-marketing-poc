@@ -12,6 +12,8 @@ from typing import Any
 from brand_kit import brand_kit_prompt_context, normalize_brand_kit
 from creative_workflow import build_ai_design_prompt
 
+MAX_CREATIVE_GENERATION_PROMPT_CHARS = 12_000
+
 CREATIVE_METHODS = (
     "gemini",
     "canva",
@@ -45,6 +47,18 @@ PROVIDER_CAPABILITIES = {
         "credential": "None",
     },
 }
+
+
+def _require_prompt_size(prompt: str, label: str) -> str:
+    value = str(prompt or "").strip()
+    if not value:
+        raise ValueError(f"{label} must not be empty.")
+    if len(value) > MAX_CREATIVE_GENERATION_PROMPT_CHARS:
+        raise ValueError(
+            f"{label} is too large for the creative-generation pipeline. "
+            "Reduce Brand Kit or design-brief detail."
+        )
+    return value
 
 
 def recommended_aspect_ratio(format_name: str, platform: str = "") -> str:
@@ -92,7 +106,8 @@ def build_branded_design_prompt(
     extra = [
         "",
         "BRAND KIT:",
-        brand_context or "- No saved Brand Kit. Keep the visual neutral and do not invent brand identity.",
+        brand_context
+        or "- No saved Brand Kit. Keep the visual neutral and do not invent brand identity.",
         "",
         "PRODUCTION SAFETY:",
         "- Never invent, redraw, or imitate a client logo. If a logo is available, leave a clean placement zone for the real logo asset.",
@@ -116,8 +131,12 @@ def build_branded_design_prompt(
             ]
         )
         if approved_visible_copy:
-            extra.append("- Approved visible-copy source: " + " | ".join(approved_visible_copy))
-    return (base + "\n" + "\n".join(extra)).strip()
+            extra.append(
+                "- Approved visible-copy source: " + " | ".join(approved_visible_copy)
+            )
+    return _require_prompt_size(
+        (base + "\n" + "\n".join(extra)).strip(), "Creative generation prompt"
+    )
 
 
 def build_design_revision_prompt(
@@ -128,7 +147,12 @@ def build_design_revision_prompt(
     approved_post: Mapping[str, Any],
     brand_kit: Mapping[str, Any] | None = None,
 ) -> str:
-    """Create a constrained image-revision prompt for a rejected creative."""
+    """Create a constrained image-revision prompt for a rejected creative.
+
+    Senior feedback and immutable approved content are always kept in full. The
+    prior creative prompt is supporting context only and is clipped when needed
+    so revisions remain within the same 12k boundary used by Gemini and storage.
+    """
 
     feedback = str(senior_feedback or "").strip()
     fields = [str(item).strip() for item in change_fields if str(item).strip()]
@@ -139,12 +163,21 @@ def build_design_revision_prompt(
 
     content = dict(approved_post.get("content") or {})
     immutable = []
-    for field in ("Platform", "Pillar", "Format", "Content Idea", "CTA", "Caption", "Reel Script"):
+    for field in (
+        "Platform",
+        "Pillar",
+        "Format",
+        "Content Idea",
+        "CTA",
+        "Caption",
+        "Reel Script",
+    ):
         value = str(content.get(field) or "").strip()
         if value:
             immutable.append(f"- {field}: {value}")
     brand_context = brand_kit_prompt_context(brand_kit)
-    return "\n".join(
+
+    prefix = "\n".join(
         [
             "Revise the previous creative using ONLY the Senior-requested design changes below.",
             "Do not rewrite or reinterpret the approved marketing content.",
@@ -162,7 +195,10 @@ def build_design_revision_prompt(
             brand_context or "- No saved Brand Kit. Do not invent a brand identity.",
             "",
             "ORIGINAL CREATIVE PROMPT:",
-            str(original_prompt or "").strip(),
+        ]
+    )
+    suffix = "\n".join(
+        [
             "",
             "REVISION RULES:",
             "- Change only what is necessary to satisfy the Senior feedback.",
@@ -170,7 +206,21 @@ def build_design_revision_prompt(
             "- Never invent or redraw the client logo.",
             "- Return one revised production-ready visual.",
         ]
-    ).strip()
+    )
+    original = str(original_prompt or "").strip()
+    fixed_length = len(prefix) + len(suffix) + 2
+    available = MAX_CREATIVE_GENERATION_PROMPT_CHARS - fixed_length
+    if available < 200:
+        raise ValueError(
+            "Senior feedback, approved content, and Brand Kit are too large for one revision request."
+        )
+    if len(original) > available:
+        marker = "\n[Earlier creative prompt clipped to fit the revision request.]"
+        keep = max(0, available - len(marker))
+        original = original[:keep].rstrip() + marker
+    return _require_prompt_size(
+        f"{prefix}\n{original}\n{suffix}".strip(), "Creative revision prompt"
+    )
 
 
 def generated_image_extension(mime_type: str) -> str:
