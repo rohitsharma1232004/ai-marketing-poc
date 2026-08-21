@@ -15,7 +15,7 @@ Client details
   -> user creates secure Senior Review Link
   -> Senior opens link in a separate browser/device
        -> sees only client/campaign/version + content package + decision controls
-       -> Approve -> Excel download unlocked
+       -> Approve -> Excel download + Design Brief Generator unlocked
        -> Request Changes -> Excel remains locked
             -> Senior chooses Specific Post or Whole Calendar
             -> Senior selects only the field(s) that need changes
@@ -66,6 +66,9 @@ Only the Senior is an approval gate in the active POC. Client approval and Whats
 - An older approval never unlocks a newer version.
 - Senior approval is terminal for the active POC and moves the campaign to `fully_approved`.
 - Excel export is allowed only when the latest version has a matching Senior `approved` decision. The exported content package displays `Senior Approved` status.
+- Design briefs can be generated only for the latest hash-matched, finally Senior-approved content version.
+- Design briefs are stored separately from approved content, so creative instructions cannot rewrite the approved package.
+- The dashboard derives `Design Status` as Locked, Not Generated, or Design Brief Ready without changing the approved content hash.
 
 ## Local testing
 
