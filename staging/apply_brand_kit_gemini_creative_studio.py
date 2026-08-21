@@ -18,11 +18,13 @@ import apply_creative_provenance_v10 as provenance
 import apply_creative_studio_runtime_hotfix as studio_hotfix
 import apply_creative_studio_ui as studio_ui
 import apply_gemini_text_provider as gemini_text
+import apply_gemini_text_provider_ux_hotfix as gemini_text_ux
 
 
 def main() -> None:
     brand_store.main()
     gemini_text.main()
+    gemini_text_ux.main()
     studio_ui.main()
     studio_hotfix.main()
     provenance.main()
