@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from campaign_store import CampaignStore, StoreConflict
+from content_package import CONTENT_PACKAGE_HEADERS, CONTENT_STATUS_READY
 from senior_review_links import (
     build_review_url,
     generate_review_token,
@@ -29,6 +30,18 @@ ROWS = [[
     "useful keyword",
     "Learn more",
 ]]
+PACKAGE_ROWS = [[
+    "Mon, Aug 24",
+    "Instagram",
+    "Educational",
+    "Reel",
+    "Helpful idea",
+    "useful keyword",
+    "Learn more",
+    "A useful publish-ready caption for the audience.",
+    "Hook: Start here; Scene 1: Explain the point; CTA: Learn more",
+    CONTENT_STATUS_READY,
+]]
 
 
 def future_iso(hours=2):
@@ -37,14 +50,14 @@ def future_iso(hours=2):
     ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def make_review_ready_store():
+def make_review_ready_store(headers=HEADERS, rows=ROWS):
     temp = tempfile.TemporaryDirectory()
     store = CampaignStore(Path(temp.name) / "campaigns.sqlite3")
     client = store.create_or_update_client("ABC Realty", {"industry": "Real Estate"})
     campaign = store.create_campaign(
         client["id"], {"goal": "Leads"}, request_id="request-review-link"
     )
-    version = store.complete_generation(campaign["id"], HEADERS, ROWS)
+    version = store.complete_generation(campaign["id"], headers, rows)
     return temp, store, client, campaign, version
 
 
@@ -202,6 +215,91 @@ def test_structured_change_rejects_unsupported_fields():
                     "post_number": 1,
                     "row_index": 0,
                     "fields": ["Platform"],
+                },
+            )
+    finally:
+        store.close()
+        temp.cleanup()
+
+
+def test_content_package_reel_can_request_caption_and_script_changes():
+    temp, store, _client, campaign, version = make_review_ready_store(
+        list(CONTENT_PACKAGE_HEADERS), PACKAGE_ROWS
+    )
+    try:
+        token_hash = hash_review_token(generate_review_token())
+        store.create_senior_review_link(
+            campaign["id"], version["id"], token_hash, future_iso()
+        )
+        result = store.decide_senior_review_link(
+            token_hash,
+            "rejected",
+            "Senior Reviewer",
+            "senior@example.com",
+            "Sharpen the caption and make the reel opening stronger.",
+            change_request={
+                "scope": "specific_post",
+                "post_number": 1,
+                "row_index": 0,
+                "fields": ["Reel Script", "Caption"],
+            },
+        )
+        assert result["change_request"]["fields"] == ["Caption", "Reel Script"]
+    finally:
+        store.close()
+        temp.cleanup()
+
+
+def test_content_package_image_cannot_request_reel_script_change():
+    image_row = [PACKAGE_ROWS[0].copy()]
+    image_row[0][3] = "Image"
+    image_row[0][8] = "Not applicable"
+    temp, store, _client, campaign, version = make_review_ready_store(
+        list(CONTENT_PACKAGE_HEADERS), image_row
+    )
+    try:
+        token_hash = hash_review_token(generate_review_token())
+        store.create_senior_review_link(
+            campaign["id"], version["id"], token_hash, future_iso()
+        )
+        with pytest.raises(ValueError, match="Reel Script"):
+            store.decide_senior_review_link(
+                token_hash,
+                "rejected",
+                "Senior Reviewer",
+                "senior@example.com",
+                "Add a reel script.",
+                change_request={
+                    "scope": "specific_post",
+                    "post_number": 1,
+                    "row_index": 0,
+                    "fields": ["Reel Script"],
+                },
+            )
+    finally:
+        store.close()
+        temp.cleanup()
+
+
+def test_legacy_calendar_cannot_request_caption_field():
+    temp, store, _client, campaign, version = make_review_ready_store()
+    try:
+        token_hash = hash_review_token(generate_review_token())
+        store.create_senior_review_link(
+            campaign["id"], version["id"], token_hash, future_iso()
+        )
+        with pytest.raises(ValueError, match="does not contain"):
+            store.decide_senior_review_link(
+                token_hash,
+                "rejected",
+                "Senior Reviewer",
+                "senior@example.com",
+                "Rewrite the caption.",
+                change_request={
+                    "scope": "specific_post",
+                    "post_number": 1,
+                    "row_index": 0,
+                    "fields": ["Caption"],
                 },
             )
     finally:
