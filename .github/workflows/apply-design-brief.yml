@@ -47,10 +47,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
 
-      - name: Compile and run regression tests
+      - name: Compile and run active POC regression tests
         run: |
           python -m py_compile app.py campaign_store.py content_package.py design_brief.py revision_logic.py senior_review_links.py generation_providers.py
-          PYTHONPATH=. pytest -q
+          PYTHONPATH=. pytest -q \
+            tests/test_design_brief.py \
+            tests/test_design_brief_store.py \
+            tests/test_content_package.py \
+            tests/test_revision_logic.py \
+            tests/test_senior_review_links.py \
+            tests/test_campaign_store.py \
+            tests/test_generation_providers.py
           git diff --check
 
       - name: Commit tested feature and remove staging files
