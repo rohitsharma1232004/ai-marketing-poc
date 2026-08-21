@@ -26,14 +26,15 @@ class CalendarWebhookHandler(BaseHTTPRequestHandler):
 
         posts = int(body["expected_posts"])
         lines = [
-            "| Date | Platform | Pillar | Format | Content Idea | SEO Keyword Focus | CTA |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| Date | Platform | Pillar | Format | Content Idea | SEO Keyword Focus | CTA | Caption | Reel Script |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for index in range(posts):
             keyword = "" if self.blank_first_keyword and index == 0 else f"keyword {index + 1}"
             lines.append(
                 "| Placeholder | Instagram | Educational | Image | "
-                f"Content idea {index + 1} | {keyword} | Learn more |"
+                f"Content idea {index + 1} | {keyword} | Learn more | "
+                f"Helpful caption {index + 1} | Not applicable |"
             )
 
         response_body = json.dumps(
@@ -83,10 +84,10 @@ class AppN8nIntegrationTests(unittest.TestCase):
         raise AssertionError(f"Could not find a text widget labelled {label!r}")
 
     @staticmethod
-    def _has_download(app, label="Download Content Calendar Excel"):
+    def _has_download(app, label="Download Approved Content Package Excel"):
         return any(item.label == label for item in app.download_button)
 
-    def test_streamlit_generates_excel_without_approval(self):
+    def test_streamlit_requires_senior_approval_before_excel(self):
         CalendarWebhookHandler.blank_first_keyword = False
         server = ThreadingHTTPServer(("127.0.0.1", 0), CalendarWebhookHandler)
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -109,7 +110,7 @@ class AppN8nIntegrationTests(unittest.TestCase):
                 app.run()
                 self._widget(app, "number_input", "Image").set_value(12)
                 self._widget(app, "number_input", "Educational").set_value(12)
-                self._widget(app, "button", "Generate Content Calendar").click().run(timeout=20)
+                self._widget(app, "button", "Generate Content Package").click().run(timeout=20)
 
                 store = CampaignStore(environment["CAMPAIGN_DB_PATH"])
                 saved_campaigns = store.list_campaigns()
@@ -117,29 +118,42 @@ class AppN8nIntegrationTests(unittest.TestCase):
                 saved_campaign = store.get_campaign(campaign_id)
                 saved_calendar = store.get_latest_calendar(campaign_id)
                 export_directory = Path(environment["GENERATED_OUTPUT_DIR"])
-                excel_files = list(export_directory.glob("*.xlsx"))
-                download_visible = self._has_download(app)
-                approval_buttons = {
-                    item.label for item in app.button
-                    if item.label in {"Senior Approve", "Senior Reject", "Client Approve", "Client Reject"}
-                }
-                errors = [item.value for item in app.error]
-                exceptions = [item.message for item in app.exception]
+                excel_before_approval = list(export_directory.glob("*.xlsx"))
+                download_before_approval = self._has_download(app)
+                errors_before_approval = [item.value for item in app.error]
+                exceptions_before_approval = [item.message for item in app.exception]
 
-                self.assertEqual(len(excel_files), 1)
-                with zipfile.ZipFile(excel_files[0]) as workbook:
-                    client_details_xml = workbook.read(
-                        "xl/worksheets/sheet2.xml"
-                    ).decode("utf-8")
+                store.record_approval(
+                    campaign_id,
+                    saved_calendar["id"],
+                    "senior",
+                    "approved",
+                    "Senior Reviewer",
+                    "senior@example.com",
+                    senior_is_final=True,
+                )
 
-                # Reopen the same persisted calendar and confirm direct download remains available.
+                # Reopen the same persisted campaign after exact-version Senior approval.
                 app = AppTest.from_file(str(app_path), default_timeout=20)
                 app.secrets.update(environment)
                 app.run()
                 self._set_text(app, "Campaign ID", campaign_id)
                 self._widget(app, "button", "Open Saved Calendar").click().run(timeout=20)
-                reopened_download_visible = self._has_download(app)
+                download_after_approval = self._has_download(app)
                 reopened_campaign_id = app.session_state["campaign_id"]
+                excel_after_approval = list(export_directory.glob("*.xlsx"))
+                errors_after_approval = [item.value for item in app.error]
+                exceptions_after_approval = [item.message for item in app.exception]
+
+                self.assertEqual(excel_before_approval, [])
+                self.assertFalse(download_before_approval)
+                self.assertEqual(len(excel_after_approval), 1)
+                self.assertTrue(download_after_approval)
+
+                with zipfile.ZipFile(excel_after_approval[0]) as workbook:
+                    client_details_xml = workbook.read(
+                        "xl/worksheets/sheet2.xml"
+                    ).decode("utf-8")
         finally:
             server.shutdown()
             server.server_close()
@@ -157,8 +171,6 @@ class AppN8nIntegrationTests(unittest.TestCase):
         self.assertEqual(CalendarWebhookHandler.received_body["expected_posts"], 12)
         self.assertEqual(CalendarWebhookHandler.received_body["campaign_id"], campaign_id)
         self.assertEqual(len(saved_campaigns), 1)
-        # The SQLite schema retains this legacy internal state for compatibility;
-        # the active Excel-only UI does not expose or require an approval step.
         self.assertEqual(saved_campaign["status"], "pending_senior_review")
         self.assertEqual(
             saved_campaign["intake"]["format_mix"],
@@ -169,17 +181,14 @@ class AppN8nIntegrationTests(unittest.TestCase):
             [{"label": "Educational", "count": 12}],
         )
         self.assertIsNotNone(saved_calendar)
-        self.assertTrue(download_visible)
-        self.assertEqual(approval_buttons, set())
-        self.assertEqual(errors, [])
-        self.assertEqual(exceptions, [])
+        self.assertEqual(errors_before_approval, [])
+        self.assertEqual(exceptions_before_approval, [])
+        self.assertEqual(errors_after_approval, [])
+        self.assertEqual(exceptions_after_approval, [])
         self.assertEqual(reopened_campaign_id, campaign_id)
-        self.assertTrue(reopened_download_visible)
         self.assertIn(campaign_id, client_details_xml)
         self.assertIn(saved_calendar["id"], client_details_xml)
         self.assertIn(saved_calendar["content_hash"], client_details_xml)
-        self.assertNotIn("Senior Reviewer", client_details_xml)
-        self.assertNotIn("Client Reviewer", client_details_xml)
 
     def test_streamlit_rejects_blank_required_calendar_cell(self):
         CalendarWebhookHandler.blank_first_keyword = True
@@ -202,7 +211,7 @@ class AppN8nIntegrationTests(unittest.TestCase):
                 app = AppTest.from_file(str(app_path), default_timeout=20)
                 app.secrets.update(environment)
                 app.run()
-                self._widget(app, "button", "Generate Content Calendar").click().run(timeout=20)
+                self._widget(app, "button", "Generate Content Package").click().run(timeout=20)
                 store = CampaignStore(environment["CAMPAIGN_DB_PATH"])
                 saved_campaigns = store.list_campaigns()
                 saved_calendar = store.get_latest_calendar(saved_campaigns[0]["id"])
