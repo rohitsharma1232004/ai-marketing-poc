@@ -81,7 +81,7 @@ def _seed_approved_database(path):
         (content_hash,),
     )
     connection.execute(
-        "INSERT INTO creative_assets VALUES ('asset-1','campaign-1','calendar-1',?,1,0,'Image',1,'image/png',?)",
+        "INSERT INTO creative_assets VALUES ('asset-1','campaign-1','calendar-1',?,1,0,'Image',1,'image/jpeg',?)",
         (content_hash, creative_hash),
     )
     connection.execute(
@@ -109,7 +109,7 @@ def test_queue_is_bound_to_exact_approved_content_and_creative(tmp_path):
         creative_asset_id="asset-1",
         connection_id=meta["id"],
         platform="instagram",
-        public_media_url="https://cdn.example.com/post.png",
+        public_media_url="https://cdn.example.com/post.jpg",
     )
     assert job["status"] == "queued"
     assert job["creative_hash"] == "b" * 64
@@ -121,7 +121,7 @@ def test_queue_is_bound_to_exact_approved_content_and_creative(tmp_path):
         creative_asset_id="asset-1",
         connection_id=meta["id"],
         platform="instagram",
-        public_media_url="https://cdn.example.com/another-url.png",
+        public_media_url="https://cdn.example.com/another-url.jpg",
     )
     assert duplicate["id"] == job["id"]
 
@@ -148,7 +148,7 @@ def test_design_gate_locks_when_latest_creative_is_not_approved(tmp_path):
             creative_asset_id="asset-1",
             connection_id=meta["id"],
             platform="instagram",
-            public_media_url="https://cdn.example.com/post.png",
+            public_media_url="https://cdn.example.com/post.jpg",
         )
 
 
@@ -168,7 +168,7 @@ def test_outcome_unknown_job_cannot_be_blindly_requeued(tmp_path):
         creative_asset_id="asset-1",
         connection_id=meta["id"],
         platform="facebook",
-        public_media_url="https://cdn.example.com/post.png",
+        public_media_url="https://cdn.example.com/post.jpg",
     )
     claimed = store.claim_due_jobs(limit=1)
     assert claimed[0]["id"] == job["id"]
