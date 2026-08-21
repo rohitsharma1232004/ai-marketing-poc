@@ -50,8 +50,8 @@ jobs:
       - name: Apply Groq rate-limit diagnostics
         run: python staging/apply_groq_rate_limit_diagnostics.py
 
-      - name: Apply Meta publishing UI
-        run: python staging/apply_meta_publishing_ui.py
+      - name: Apply complete Meta publishing feature
+        run: python staging/apply_meta_publishing_complete.py
 
       - name: Compile
         run: >-
@@ -68,11 +68,14 @@ jobs:
           generation_router.py
           gemini_api.py
           meta_publisher.py
+          publishing_media.py
+          publishing_runtime.py
           publishing_store.py
           publishing_worker.py
           publishing_workflow.py
           revision_logic.py
           senior_review_links.py
+          supabase_media.py
 
       - name: Test
         run: python -m pytest -q
