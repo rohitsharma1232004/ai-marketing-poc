@@ -1,0 +1,65 @@
+name: Feature validation
+
+on:
+  push:
+    branches:
+      - feature/senior-design-approval
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Apply Senior Design Approval feature
+        run: python staging/apply_senior_design_approval_v2.py
+
+      - name: Apply design approval hardening
+        run: python staging/apply_design_approval_final_improvements.py
+
+      - name: Apply design approval runtime fixes
+        run: python staging/apply_design_approval_runtime_hotfix.py
+
+      - name: Apply design review refresh UX
+        run: python staging/apply_design_review_refresh_hotfix.py
+
+      - name: Apply Brand Kit and Gemini Creative Studio
+        run: python staging/apply_brand_kit_gemini_creative_studio.py
+
+      - name: Compile
+        run: >-
+          python -m py_compile
+          app.py
+          campaign_store.py
+          brand_kit.py
+          brand_design_brief.py
+          content_package.py
+          creative_studio.py
+          creative_workflow.py
+          design_brief.py
+          generation_providers.py
+          generation_router.py
+          gemini_api.py
+          revision_logic.py
+          senior_review_links.py
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Diff sanity check
+        run: git diff --check
