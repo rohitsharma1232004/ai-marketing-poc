@@ -30,7 +30,7 @@ def _job(platform="instagram"):
         "id": "job-1",
         "status": "publishing",
         "platform": platform,
-        "public_media_url": "https://cdn.example.com/post.png",
+        "public_media_url": "https://cdn.example.com/post.jpg",
         "caption": "Approved caption",
     }
 
@@ -70,3 +70,27 @@ def test_success_marks_platform_post_id(monkeypatch):
     )
     assert result["status"] == "published"
     assert result["platform_post_id"] == "ig-media-1"
+
+
+def test_runtime_resolver_prefers_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("META_TOKEN_CLIENT_1", "environment-token")
+    monkeypatch.setattr(
+        publishing_worker,
+        "DEFAULT_LOCAL_SECRETS_PATH",
+        tmp_path / "missing.toml",
+    )
+    assert (
+        publishing_worker.resolve_token_from_runtime("META_TOKEN_CLIENT_1")
+        == "environment-token"
+    )
+
+
+def test_runtime_resolver_can_read_local_streamlit_secret(monkeypatch, tmp_path):
+    monkeypatch.delenv("META_TOKEN_CLIENT_1", raising=False)
+    secrets_path = tmp_path / "secrets.toml"
+    secrets_path.write_text('META_TOKEN_CLIENT_1 = "local-secret"\n', encoding="utf-8")
+    monkeypatch.setattr(publishing_worker, "DEFAULT_LOCAL_SECRETS_PATH", secrets_path)
+    assert (
+        publishing_worker.resolve_token_from_runtime("META_TOKEN_CLIENT_1")
+        == "local-secret"
+    )
