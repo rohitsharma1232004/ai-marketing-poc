@@ -22,7 +22,7 @@ from typing import Any, Iterator
 from uuid import UUID, uuid4
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 CAMPAIGN_STATUSES = frozenset(
     {
         "generating",
@@ -62,6 +62,9 @@ MAX_JSON_CHARS = 1_000_000
 MAX_APPROVER_NAME_CHARS = 200
 MAX_APPROVER_EMAIL_CHARS = 320
 MAX_APPROVAL_FEEDBACK_CHARS = 5_000
+MAX_REVISION_DESCRIPTION_CHARS = 5_000
+REVISION_SCOPES = frozenset({"specific_post", "whole_calendar"})
+REVISION_FIELDS = frozenset({"Content Idea", "SEO Keyword Focus", "CTA"})
 MAX_RECIPIENT_NAME_CHARS = 200
 MAX_MANUAL_SHARE_NOTE_CHARS = 2_000
 MAX_DEDUPE_KEY_CHARS = 300
@@ -1307,6 +1310,409 @@ class CampaignStore:
             "outbox": _notification_outbox_from_row(outbox_row) if outbox_row else None,
         }
 
+    def create_senior_review_link(
+        self,
+        campaign_id: str,
+        calendar_version_id: str,
+        token_hash: str,
+        expires_at: str,
+    ) -> dict[str, Any]:
+        """Create one revocable, version-bound Senior share link.
+
+        Only a SHA-256 hash of the opaque capability token is stored. Creating a
+        new link revokes any still-pending link for the same calendar version.
+        """
+
+        clean_campaign_id = _canonical_uuid(campaign_id, "campaign_id")
+        clean_version_id = _canonical_uuid(calendar_version_id, "calendar_version_id")
+        clean_hash = _sha256_hash(token_hash, "token_hash")
+        clean_expires_at = _future_utc_timestamp(expires_at, "expires_at")
+        now = _utc_now()
+        link_id = str(uuid4())
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (clean_campaign_id,)
+            ).fetchone()
+            if campaign is None:
+                raise RecordNotFound(f"Campaign {clean_campaign_id} was not found.")
+            if campaign["status"] not in {"pending_senior_review", "pending_review"}:
+                raise InvalidStatusTransition(
+                    "A Senior review link can only be created while Senior review is pending."
+                )
+            calendar = connection.execute(
+                "SELECT * FROM calendar_versions WHERE id=? AND campaign_id=?",
+                (clean_version_id, clean_campaign_id),
+            ).fetchone()
+            if calendar is None:
+                raise RecordNotFound(
+                    "That calendar version does not belong to this campaign."
+                )
+            latest = connection.execute(
+                "SELECT id FROM calendar_versions WHERE campaign_id=? "
+                "ORDER BY version DESC LIMIT 1",
+                (clean_campaign_id,),
+            ).fetchone()
+            if latest is None or latest["id"] != clean_version_id:
+                raise StoreConflict(
+                    "Only the latest calendar version can receive a Senior review link."
+                )
+
+            calculated_hash = _calendar_content_hash(
+                _deserialize_json(calendar["headers_json"]),
+                _deserialize_json(calendar["rows_json"]),
+                _deserialize_json(calendar["client_metadata_json"]),
+                _deserialize_json(calendar["generation_metadata_json"]),
+            )
+            if calculated_hash != calendar["content_hash"]:
+                raise StoreConflict(
+                    "The calendar content no longer matches its stored hash."
+                )
+            duplicate_approval = connection.execute(
+                "SELECT 1 FROM approvals WHERE campaign_id=? AND calendar_version_id=? "
+                "AND role='senior'",
+                (clean_campaign_id, clean_version_id),
+            ).fetchone()
+            if duplicate_approval is not None:
+                raise StoreConflict(
+                    "This calendar version already has a Senior decision."
+                )
+
+            connection.execute(
+                "UPDATE senior_review_links SET status='revoked',revoked_at=? "
+                "WHERE campaign_id=? AND calendar_version_id=? AND status='pending'",
+                (now, clean_campaign_id, clean_version_id),
+            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO senior_review_links (
+                        id,campaign_id,calendar_version_id,content_hash,token_hash,
+                        status,expires_at,opened_at,decided_at,revoked_at,created_at
+                    ) VALUES (?,?,?,?,?,'pending',?,NULL,NULL,NULL,?)
+                    """,
+                    (
+                        link_id, clean_campaign_id, clean_version_id,
+                        calculated_hash, clean_hash, clean_expires_at, now,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StoreConflict("Could not create a unique Senior review link.") from error
+            self._insert_event(
+                connection,
+                campaign_id=clean_campaign_id,
+                event_type="senior_review_link_created",
+                details={
+                    "review_link_id": link_id,
+                    "calendar_version_id": clean_version_id,
+                    "expires_at": clean_expires_at,
+                },
+                from_status=campaign["status"],
+                to_status=campaign["status"],
+                timestamp=now,
+            )
+            row = connection.execute(
+                "SELECT * FROM senior_review_links WHERE id=?", (link_id,)
+            ).fetchone()
+            connection.commit()
+        return _senior_review_link_from_row(row)
+
+    def get_senior_review_link_bundle(
+        self, token_hash: str, *, mark_opened: bool = False
+    ) -> dict[str, Any]:
+        """Resolve a pending Senior review capability without exposing its hash."""
+
+        clean_hash = _sha256_hash(token_hash, "token_hash")
+        now = _utc_now()
+        with self._connection() as connection:
+            if mark_opened:
+                connection.execute("BEGIN IMMEDIATE")
+            link = connection.execute(
+                "SELECT * FROM senior_review_links WHERE token_hash=?", (clean_hash,)
+            ).fetchone()
+            if link is None:
+                raise RecordNotFound("Senior review link was not found.")
+            if link["status"] != "pending":
+                raise StoreConflict("This Senior review link is no longer active.")
+            if link["expires_at"] <= now:
+                raise StoreConflict("This Senior review link has expired.")
+
+            campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (link["campaign_id"],)
+            ).fetchone()
+            calendar = connection.execute(
+                "SELECT * FROM calendar_versions WHERE id=? AND campaign_id=?",
+                (link["calendar_version_id"], link["campaign_id"]),
+            ).fetchone()
+            if campaign is None or calendar is None:
+                raise StoreConflict("This Senior review link is unavailable.")
+            if campaign["status"] not in {"pending_senior_review", "pending_review"}:
+                raise StoreConflict("This campaign is no longer awaiting Senior review.")
+            latest = connection.execute(
+                "SELECT id FROM calendar_versions WHERE campaign_id=? "
+                "ORDER BY version DESC LIMIT 1",
+                (link["campaign_id"],),
+            ).fetchone()
+            if latest is None or latest["id"] != link["calendar_version_id"]:
+                raise StoreConflict("This Senior review link is for an older version.")
+            calculated_hash = _calendar_content_hash(
+                _deserialize_json(calendar["headers_json"]),
+                _deserialize_json(calendar["rows_json"]),
+                _deserialize_json(calendar["client_metadata_json"]),
+                _deserialize_json(calendar["generation_metadata_json"]),
+            )
+            if calculated_hash != calendar["content_hash"] or calculated_hash != link["content_hash"]:
+                raise StoreConflict("This Senior review link does not match the saved calendar.")
+            client = connection.execute(
+                "SELECT * FROM clients WHERE id=?", (campaign["client_id"],)
+            ).fetchone()
+            if client is None:
+                raise StoreConflict("The client record for this review is unavailable.")
+            if mark_opened and link["opened_at"] is None:
+                connection.execute(
+                    "UPDATE senior_review_links SET opened_at=? WHERE id=?",
+                    (now, link["id"]),
+                )
+                link = connection.execute(
+                    "SELECT * FROM senior_review_links WHERE id=?", (link["id"],)
+                ).fetchone()
+                connection.commit()
+            return {
+                "link": _senior_review_link_from_row(link),
+                "campaign": _campaign_from_row(campaign),
+                "calendar": _calendar_from_row(calendar),
+                "client": _client_from_row(client),
+            }
+
+    def get_senior_change_request(
+        self, campaign_id: str, calendar_version_id: str
+    ) -> dict[str, Any] | None:
+        """Return the structured Senior change request for one calendar version."""
+
+        clean_campaign_id = _canonical_uuid(campaign_id, "campaign_id")
+        clean_calendar_id = _canonical_uuid(calendar_version_id, "calendar_version_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM senior_change_requests "
+                "WHERE campaign_id=? AND calendar_version_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (clean_campaign_id, clean_calendar_id),
+            ).fetchone()
+        return _senior_change_request_from_row(row) if row is not None else None
+
+    def decide_senior_review_link(
+        self,
+        token_hash: str,
+        decision: str,
+        approver_name: str,
+        approver_email: str,
+        feedback: str = "",
+        *,
+        change_request: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Save a Senior link decision and consume the capability atomically.
+
+        Rejections may include a structured field-level change request. The plain
+        ``feedback`` value remains on the immutable approval record for backward
+        compatibility and human-readable audit history.
+        """
+
+        clean_hash = _sha256_hash(token_hash, "token_hash")
+        clean_decision = _approval_choice(
+            decision, "decision", {"approved", "rejected"}
+        )
+        clean_name = _required_text(
+            approver_name, "approver_name", max_length=MAX_APPROVER_NAME_CHARS
+        )
+        clean_email = _required_text(
+            approver_email, "approver_email", max_length=MAX_APPROVER_EMAIL_CHARS
+        )
+        clean_feedback = _bounded_optional_text(
+            feedback, "feedback", max_length=MAX_APPROVAL_FEEDBACK_CHARS
+        )
+        if clean_decision == "rejected" and not clean_feedback:
+            raise ValueError("Required changes description is mandatory when requesting changes.")
+
+        normalized_change: dict[str, Any] | None = None
+        if clean_decision == "rejected" and change_request is not None:
+            normalized_change = _normalize_senior_change_request(
+                change_request, required_changes=clean_feedback
+            )
+
+        now = _utc_now()
+        approval_id = str(uuid4())
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            link = connection.execute(
+                "SELECT * FROM senior_review_links WHERE token_hash=?", (clean_hash,)
+            ).fetchone()
+            if link is None:
+                raise RecordNotFound("Senior review link was not found.")
+            if link["status"] != "pending":
+                raise StoreConflict("This Senior review link is no longer active.")
+            if link["expires_at"] <= now:
+                raise StoreConflict("This Senior review link has expired.")
+            campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (link["campaign_id"],)
+            ).fetchone()
+            calendar = connection.execute(
+                "SELECT * FROM calendar_versions WHERE id=? AND campaign_id=?",
+                (link["calendar_version_id"], link["campaign_id"]),
+            ).fetchone()
+            if campaign is None or calendar is None:
+                raise StoreConflict("This Senior review link is unavailable.")
+            if campaign["status"] not in {"pending_senior_review", "pending_review"}:
+                raise InvalidStatusTransition(
+                    "This campaign is no longer awaiting Senior review."
+                )
+            latest = connection.execute(
+                "SELECT id FROM calendar_versions WHERE campaign_id=? "
+                "ORDER BY version DESC LIMIT 1",
+                (link["campaign_id"],),
+            ).fetchone()
+            if latest is None or latest["id"] != link["calendar_version_id"]:
+                raise StoreConflict("This Senior review link is for an older version.")
+            calculated_hash = _calendar_content_hash(
+                _deserialize_json(calendar["headers_json"]),
+                _deserialize_json(calendar["rows_json"]),
+                _deserialize_json(calendar["client_metadata_json"]),
+                _deserialize_json(calendar["generation_metadata_json"]),
+            )
+            if calculated_hash != calendar["content_hash"] or calculated_hash != link["content_hash"]:
+                raise StoreConflict("This Senior review link does not match the saved calendar.")
+            duplicate = connection.execute(
+                "SELECT 1 FROM approvals WHERE campaign_id=? AND calendar_version_id=? "
+                "AND role='senior'",
+                (link["campaign_id"], link["calendar_version_id"]),
+            ).fetchone()
+            if duplicate is not None:
+                raise StoreConflict("This calendar version already has a Senior decision.")
+
+            if normalized_change is not None:
+                rows = _deserialize_json(calendar["rows_json"])
+                content_rows = [
+                    (index, row) for index, row in enumerate(rows)
+                    if isinstance(row, list) and len(row) == 7
+                ]
+                if normalized_change["scope"] == "specific_post":
+                    post_number = normalized_change["post_number"]
+                    if post_number > len(content_rows):
+                        raise ValueError("The selected post is outside this calendar version.")
+                    expected_row_index = content_rows[post_number - 1][0]
+                    if normalized_change["row_index"] != expected_row_index:
+                        raise ValueError("The selected post no longer matches this calendar version.")
+
+            new_status = "fully_approved" if clean_decision == "approved" else "revision_required"
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO approvals (
+                        id,campaign_id,calendar_version_id,role,decision,
+                        approver_name,approver_email,approver_phone_e164,
+                        identity_channel,review_request_id,feedback,content_hash,decided_at
+                    ) VALUES (?,?,?,'senior',?,?,?,NULL,
+                              'local_self_reported',NULL,?,?,?)
+                    """,
+                    (
+                        approval_id, link["campaign_id"], link["calendar_version_id"],
+                        clean_decision, clean_name, clean_email, clean_feedback,
+                        calculated_hash, now,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StoreConflict(
+                    "This calendar version already has a Senior decision."
+                ) from error
+
+            change_request_row = None
+            if normalized_change is not None:
+                change_request_id = str(uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO senior_change_requests (
+                        id,campaign_id,calendar_version_id,approval_id,scope,
+                        post_number,row_index,fields_json,required_changes,created_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        change_request_id,
+                        link["campaign_id"],
+                        link["calendar_version_id"],
+                        approval_id,
+                        normalized_change["scope"],
+                        normalized_change["post_number"],
+                        normalized_change["row_index"],
+                        _serialize_json(normalized_change["fields"], "fields"),
+                        clean_feedback,
+                        now,
+                    ),
+                )
+                change_request_row = connection.execute(
+                    "SELECT * FROM senior_change_requests WHERE id=?",
+                    (change_request_id,),
+                ).fetchone()
+
+            connection.execute(
+                "UPDATE campaigns SET status=?,updated_at=? WHERE id=?",
+                (new_status, now, link["campaign_id"]),
+            )
+            connection.execute(
+                "UPDATE senior_review_links SET status='decided',decided_at=? WHERE id=?",
+                (now, link["id"]),
+            )
+            connection.execute(
+                "UPDATE senior_review_links SET status='revoked',revoked_at=? "
+                "WHERE campaign_id=? AND calendar_version_id=? AND id<>? "
+                "AND status='pending'",
+                (now, link["campaign_id"], link["calendar_version_id"], link["id"]),
+            )
+            event_details = {
+                "approval_id": approval_id,
+                "calendar_version_id": link["calendar_version_id"],
+                "role": "senior",
+                "decision": clean_decision,
+                "content_hash": calculated_hash,
+                "review_link_id": link["id"],
+            }
+            if change_request_row is not None:
+                event_details.update(
+                    {
+                        "change_request_id": change_request_row["id"],
+                        "change_scope": change_request_row["scope"],
+                        "change_fields": _deserialize_json(change_request_row["fields_json"]),
+                        "post_number": change_request_row["post_number"],
+                    }
+                )
+            self._insert_event(
+                connection,
+                campaign_id=link["campaign_id"],
+                event_type="approval_recorded",
+                details=event_details,
+                from_status=campaign["status"],
+                to_status=new_status,
+                timestamp=now,
+            )
+            approval = connection.execute(
+                "SELECT * FROM approvals WHERE id=?", (approval_id,)
+            ).fetchone()
+            updated_campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (link["campaign_id"],)
+            ).fetchone()
+            updated_link = connection.execute(
+                "SELECT * FROM senior_review_links WHERE id=?", (link["id"],)
+            ).fetchone()
+            connection.commit()
+        return {
+            "approval": _approval_from_row(approval),
+            "campaign": _campaign_from_row(updated_campaign),
+            "link": _senior_review_link_from_row(updated_link),
+            "change_request": (
+                _senior_change_request_from_row(change_request_row)
+                if change_request_row is not None else None
+            ),
+        }
+
     def list_notification_outbox(
         self, *, status: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
@@ -1802,6 +2208,8 @@ class CampaignStore:
 
             self._ensure_v2_auxiliary_schema(connection)
             self._ensure_v3_review_schema(connection)
+            self._ensure_v5_senior_share_schema(connection)
+            self._ensure_v6_senior_change_schema(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
 
@@ -2326,6 +2734,80 @@ class CampaignStore:
         )
 
     @staticmethod
+    def _ensure_v5_senior_share_schema(connection: sqlite3.Connection) -> None:
+        """Install deployment-friendly manual Senior review-link storage."""
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS senior_review_links (
+                id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL,
+                calendar_version_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL CHECK (
+                    length(content_hash)=64 AND content_hash NOT GLOB '*[^0-9a-f]*'
+                ),
+                token_hash TEXT NOT NULL UNIQUE CHECK (
+                    length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9a-f]*'
+                ),
+                status TEXT NOT NULL CHECK (status IN ('pending','decided','revoked')),
+                expires_at TEXT NOT NULL,
+                opened_at TEXT,
+                decided_at TEXT,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (campaign_id, calendar_version_id)
+                    REFERENCES calendar_versions(campaign_id, id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS senior_review_links_campaign_idx "
+            "ON senior_review_links(campaign_id,calendar_version_id,created_at)"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS senior_review_links_one_active "
+            "ON senior_review_links(campaign_id,calendar_version_id) "
+            "WHERE status='pending'"
+        )
+
+
+    @staticmethod
+    def _ensure_v6_senior_change_schema(connection: sqlite3.Connection) -> None:
+        """Store structured Senior change requests separately from approval text."""
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS senior_change_requests (
+                id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL,
+                calendar_version_id TEXT NOT NULL,
+                approval_id TEXT NOT NULL UNIQUE,
+                scope TEXT NOT NULL CHECK (scope IN ('specific_post','whole_calendar')),
+                post_number INTEGER,
+                row_index INTEGER,
+                fields_json TEXT NOT NULL,
+                required_changes TEXT NOT NULL CHECK (
+                    length(required_changes) BETWEEN 1 AND 5000
+                ),
+                created_at TEXT NOT NULL,
+                CHECK (
+                    (scope='specific_post' AND post_number IS NOT NULL AND post_number > 0
+                     AND row_index IS NOT NULL AND row_index >= 0)
+                    OR
+                    (scope='whole_calendar' AND post_number IS NULL AND row_index IS NULL)
+                ),
+                FOREIGN KEY (campaign_id, calendar_version_id)
+                    REFERENCES calendar_versions(campaign_id, id) ON DELETE RESTRICT,
+                FOREIGN KEY (approval_id) REFERENCES approvals(id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS senior_change_requests_campaign_idx "
+            "ON senior_change_requests(campaign_id,calendar_version_id,created_at)"
+        )
+
+    @staticmethod
     def _ensure_v3_indexes_and_triggers(connection: sqlite3.Connection) -> None:
         statements = (
             "CREATE INDEX IF NOT EXISTS review_recipients_campaign_idx "
@@ -2437,6 +2919,57 @@ def _approval_choice(value: Any, label: str, choices: set[str]) -> str:
         allowed = ", ".join(sorted(choices))
         raise ValueError(f"Unsupported {label}. Use one of: {allowed}.")
     return cleaned
+
+
+def _normalize_senior_change_request(
+    value: Mapping[str, Any], *, required_changes: str
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("change_request must be an object.")
+    scope = _approval_choice(value.get("scope"), "change scope", set(REVISION_SCOPES))
+    raw_fields = value.get("fields")
+    if isinstance(raw_fields, (str, bytes)) or not isinstance(raw_fields, Sequence):
+        raise TypeError("change fields must be a list.")
+    requested = {str(field).strip() for field in raw_fields if str(field).strip()}
+    unknown = requested.difference(REVISION_FIELDS)
+    if unknown:
+        raise ValueError(f"Unsupported change field(s): {', '.join(sorted(unknown))}.")
+    fields = [
+        field for field in ("Content Idea", "SEO Keyword Focus", "CTA")
+        if field in requested
+    ]
+    if not fields:
+        raise ValueError("Select at least one field that needs changes.")
+
+    clean_required = _required_text(
+        required_changes,
+        "required_changes",
+        max_length=MAX_REVISION_DESCRIPTION_CHARS,
+    )
+    if scope == "specific_post":
+        post_number = value.get("post_number")
+        row_index = value.get("row_index")
+        if (
+            not isinstance(post_number, int) or isinstance(post_number, bool)
+            or post_number < 1
+        ):
+            raise ValueError("post_number must be a positive integer.")
+        if (
+            not isinstance(row_index, int) or isinstance(row_index, bool)
+            or row_index < 0
+        ):
+            raise ValueError("row_index must be a non-negative integer.")
+    else:
+        post_number = None
+        row_index = None
+
+    return {
+        "scope": scope,
+        "post_number": post_number,
+        "row_index": row_index,
+        "fields": fields,
+        "required_changes": clean_required,
+    }
 
 
 def _sha256_hash(value: Any, label: str) -> str:
@@ -2757,6 +3290,37 @@ def _approval_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "feedback": row["feedback"],
         "content_hash": row["content_hash"],
         "decided_at": row["decided_at"],
+    }
+
+
+def _senior_change_request_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "campaign_id": row["campaign_id"],
+        "calendar_version_id": row["calendar_version_id"],
+        "approval_id": row["approval_id"],
+        "scope": row["scope"],
+        "post_number": row["post_number"],
+        "row_index": row["row_index"],
+        "fields": _deserialize_json(row["fields_json"]),
+        "required_changes": row["required_changes"],
+        "created_at": row["created_at"],
+    }
+
+
+def _senior_review_link_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    # The capability token hash is intentionally omitted from normal return values.
+    return {
+        "id": row["id"],
+        "campaign_id": row["campaign_id"],
+        "calendar_version_id": row["calendar_version_id"],
+        "content_hash": row["content_hash"],
+        "status": row["status"],
+        "expires_at": row["expires_at"],
+        "opened_at": row["opened_at"],
+        "decided_at": row["decided_at"],
+        "revoked_at": row["revoked_at"],
+        "created_at": row["created_at"],
     }
 
 

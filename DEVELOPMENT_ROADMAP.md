@@ -4,7 +4,7 @@ The active demo is now intentionally limited to:
 
 `Client details -> generation -> validated content calendar -> Senior approval -> Excel download`
 
-Only one human gate is active: **Senior approval**. Client approval, FastAPI review links, and WhatsApp approval delivery are archived under `legacy_approval_whatsapp/` and are not part of the active Streamlit flow.
+Only one human gate is active: **Senior approval**. Client approval and WhatsApp delivery are archived under `legacy_approval_whatsapp/`. The active Streamlit app now supports a secure Senior-only share-link mode so the same deployment can serve both the internal dashboard and the restricted review page.
 
 The database keeps older two-stage fields/statuses for compatibility, but the active Excel gate checks only for a hash-matched Senior approval on the latest calendar version.
 
@@ -86,15 +86,14 @@ Status: **secure-link development POC complete; production hardening planned**
   decisions, feedback, timestamps, version IDs, and content hashes.
 - Local final Excel creation is allowed only after the latest version has matching
   Senior approval.
-- Selected-post regeneration creates a new version and requires fresh Senior review.
-- Archived signed-link infrastructure remains available as reference for the next
-  secure shareable Senior Review URL.
+- Structured Senior change requests support Specific Post or Whole Calendar scope and field-level selection for Content Idea, SEO Keyword Focus, and CTA.
+- The marketing user can add optional instructions, while the Senior's original required-changes description remains preserved.
+- Field-level regeneration creates a new version and requires fresh Senior review.
+- Secure opaque Senior Review URLs are implemented in the active Streamlit app; raw capability tokens are never stored.
 - Add OTP/login/SSO before production so a forwarded bearer link is not sufficient
   identity proof.
-- Selected-post revision is now implemented: Senior feedback can regenerate one
-  chosen post into a new immutable calendar version, automatically requiring fresh
-  Senior approval.
-- Add a secure shareable Senior Review URL for deployed environments.
+- Field-level revision is implemented: a Senior can request, for example, SEO-only changes on Post 5 or CTA-only changes across the whole calendar. Non-requested fields are preserved exactly before the new immutable version is saved.
+- Set `APP_PUBLIC_BASE_URL` to the deployed HTTPS URL and move durable state off ephemeral local disks before production use.
 - n8n sends notifications and reacts to decisions; PostgreSQL remains the
   approval authority.
 
@@ -118,7 +117,4 @@ Status: planned
 
 ## Architecture rule
 
-n8n owns connections and automation. FastAPI owns authentication and business
-rules. PostgreSQL owns durable state and approvals. Groq creates analysis and
-content. The language model never receives unrestricted publishing credentials
-and never decides whether required approval exists.
+For the small internal POC, one Streamlit deployment owns the dashboard and the token-gated Senior review view, which avoids a second service and shared-filesystem problems. n8n owns external automation connections. The persistence layer remains isolated behind `CampaignStore`; before production, move durable state/approvals to a managed persistent database. Groq creates analysis/content only. The language model never receives unrestricted publishing credentials and never decides whether required approval exists.

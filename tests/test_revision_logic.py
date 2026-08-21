@@ -1,9 +1,13 @@
 import unittest
 
 from revision_logic import (
+    REVISION_FIELDS,
+    build_field_revision_prompt,
     build_selected_post_revision_prompt,
     list_reviewable_posts,
+    merge_revised_fields,
     merge_revised_post,
+    normalize_revision_fields,
 )
 
 
@@ -49,8 +53,7 @@ class RevisionLogicTests(unittest.TestCase):
             campaign_intake={"goal": "Lead generation", "language": "English"},
         )
         self.assertIn("Make the CTA stronger.", prompt)
-        self.assertIn("Keep Date, Platform, Pillar, and Format unchanged", prompt)
-        self.assertIn("exactly one content row", prompt)
+        self.assertIn("exactly 1 content row(s)", prompt)
 
         with self.assertRaises(ValueError):
             build_selected_post_revision_prompt(
@@ -58,6 +61,58 @@ class RevisionLogicTests(unittest.TestCase):
                 current_row=ROWS[1],
                 senior_feedback="",
             )
+
+    def test_seo_only_merge_changes_only_seo_field(self):
+        revised = [[
+            "wrong date", "wrong platform", "wrong pillar", "wrong format",
+            "wrong idea", "faridabad first home buyer", "wrong cta",
+        ]]
+        merged = merge_revised_fields(
+            ROWS,
+            target_row_indices=[1],
+            revised_rows=revised,
+            fields_to_change=["SEO Keyword Focus"],
+        )
+        self.assertEqual(merged[1][:5], ROWS[1][:5])
+        self.assertEqual(merged[1][5], "faridabad first home buyer")
+        self.assertEqual(merged[1][6], ROWS[1][6])
+        self.assertEqual(merged[2], ROWS[2])
+
+    def test_whole_calendar_cta_merge_preserves_all_other_fields(self):
+        revised = [
+            [*ROWS[1][:6], "Lead CTA 1"],
+            [*ROWS[2][:6], "Lead CTA 2"],
+        ]
+        merged = merge_revised_fields(
+            ROWS,
+            target_row_indices=[1, 2],
+            revised_rows=revised,
+            fields_to_change=["CTA"],
+        )
+        self.assertEqual(merged[1][:6], ROWS[1][:6])
+        self.assertEqual(merged[2][:6], ROWS[2][:6])
+        self.assertEqual(merged[1][6], "Lead CTA 1")
+        self.assertEqual(merged[2][6], "Lead CTA 2")
+
+    def test_field_prompt_includes_senior_and_team_instructions(self):
+        prompt = build_field_revision_prompt(
+            headers=HEADERS,
+            current_rows=[ROWS[1]],
+            fields_to_change=["SEO Keyword Focus"],
+            senior_feedback="Use buyer-intent keywords only.",
+            user_instructions="Include Sector 88 where relevant.",
+        )
+        self.assertIn("SEO Keyword Focus", prompt)
+        self.assertIn("Use buyer-intent keywords only.", prompt)
+        self.assertIn("Include Sector 88 where relevant.", prompt)
+        self.assertIn("Change ONLY these field(s): SEO Keyword Focus", prompt)
+
+    def test_revision_fields_are_restricted(self):
+        self.assertEqual(normalize_revision_fields(list(REVISION_FIELDS)), REVISION_FIELDS)
+        with self.assertRaises(ValueError):
+            normalize_revision_fields(["Platform"])
+        with self.assertRaises(ValueError):
+            normalize_revision_fields([])
 
 
 if __name__ == "__main__":

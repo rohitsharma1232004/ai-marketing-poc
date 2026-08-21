@@ -10,7 +10,8 @@ venv/
 __pycache__/
 *.py[cod]
 
-# Approved exports contain client data and stay local by default.
+# Generated/approved exports contain client data and stay local by default.
+generated_outputs/
 approved_outputs/
 
 # Local SQLite campaign database plus WAL/SHM runtime files.
