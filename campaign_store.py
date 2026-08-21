@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import Any, Iterator
 from uuid import UUID, uuid4
 
+from content_package import (
+    REEL_SCRIPT_FORMATS,
+    REVISION_FIELDS,
+    require_supported_calendar_headers,
+)
+
 
 SCHEMA_VERSION = 6
 CAMPAIGN_STATUSES = frozenset(
@@ -64,7 +70,6 @@ MAX_APPROVER_EMAIL_CHARS = 320
 MAX_APPROVAL_FEEDBACK_CHARS = 5_000
 MAX_REVISION_DESCRIPTION_CHARS = 5_000
 REVISION_SCOPES = frozenset({"specific_post", "whole_calendar"})
-REVISION_FIELDS = frozenset({"Content Idea", "SEO Keyword Focus", "CTA"})
 MAX_RECIPIENT_NAME_CHARS = 200
 MAX_MANUAL_SHARE_NOTE_CHARS = 2_000
 MAX_DEDUPE_KEY_CHARS = 300
@@ -1590,18 +1595,51 @@ class CampaignStore:
                 raise StoreConflict("This calendar version already has a Senior decision.")
 
             if normalized_change is not None:
+                headers = list(
+                    require_supported_calendar_headers(
+                        _deserialize_json(calendar["headers_json"])
+                    )
+                )
                 rows = _deserialize_json(calendar["rows_json"])
+                unavailable_fields = [
+                    field
+                    for field in normalized_change["fields"]
+                    if field not in headers
+                ]
+                if unavailable_fields:
+                    raise ValueError(
+                        "This calendar version does not contain: "
+                        + ", ".join(unavailable_fields)
+                        + "."
+                    )
+                expected_columns = len(headers)
                 content_rows = [
                     (index, row) for index, row in enumerate(rows)
-                    if isinstance(row, list) and len(row) == 7
+                    if isinstance(row, list) and len(row) == expected_columns
                 ]
+                format_index = headers.index("Format")
                 if normalized_change["scope"] == "specific_post":
                     post_number = normalized_change["post_number"]
                     if post_number > len(content_rows):
                         raise ValueError("The selected post is outside this calendar version.")
-                    expected_row_index = content_rows[post_number - 1][0]
+                    expected_row_index, selected_row = content_rows[post_number - 1]
                     if normalized_change["row_index"] != expected_row_index:
                         raise ValueError("The selected post no longer matches this calendar version.")
+                    if (
+                        "Reel Script" in normalized_change["fields"]
+                        and str(selected_row[format_index]).strip().casefold()
+                        not in REEL_SCRIPT_FORMATS
+                    ):
+                        raise ValueError(
+                            "Reel Script changes are available only for Reel or Video posts."
+                        )
+                elif "Reel Script" in normalized_change["fields"] and not any(
+                    str(row[format_index]).strip().casefold() in REEL_SCRIPT_FORMATS
+                    for _, row in content_rows
+                ):
+                    raise ValueError(
+                        "This calendar has no Reel or Video posts with a Reel Script to change."
+                    )
 
             new_status = "fully_approved" if clean_decision == "approved" else "revision_required"
             try:
@@ -2934,10 +2972,7 @@ def _normalize_senior_change_request(
     unknown = requested.difference(REVISION_FIELDS)
     if unknown:
         raise ValueError(f"Unsupported change field(s): {', '.join(sorted(unknown))}.")
-    fields = [
-        field for field in ("Content Idea", "SEO Keyword Focus", "CTA")
-        if field in requested
-    ]
+    fields = [field for field in REVISION_FIELDS if field in requested]
     if not fields:
         raise ValueError("Select at least one field that needs changes.")
 
