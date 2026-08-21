@@ -16,7 +16,9 @@ from urllib.parse import urlsplit
 
 SUPPORTED_PLATFORMS = ("facebook", "instagram")
 PHASE1_SUPPORTED_FORMATS = frozenset({"image"})
-PHASE1_SUPPORTED_MIME_TYPES = frozenset({"image/png", "image/jpeg"})
+FACEBOOK_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg"})
+# Meta's current Instagram publishing documentation specifies JPEG for image posts.
+INSTAGRAM_IMAGE_MIME_TYPES = frozenset({"image/jpeg"})
 MAX_CAPTION_CHARS = 2_200
 MAX_PUBLIC_MEDIA_URL_CHARS = 2_000
 META_CREDENTIAL_REF_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,127}$")
@@ -151,9 +153,18 @@ def validate_publishable_image(
         )
 
     mime_type = str(creative.get("mime_type") or "").strip().lower()
-    if mime_type not in PHASE1_SUPPORTED_MIME_TYPES:
+    allowed_mime_types = (
+        INSTAGRAM_IMAGE_MIME_TYPES if target == "instagram" else FACEBOOK_IMAGE_MIME_TYPES
+    )
+    if mime_type not in allowed_mime_types:
+        if target == "instagram":
+            raise PublishingEligibilityError(
+                "Instagram image publishing requires a Senior-approved JPEG creative. "
+                "Convert/export to JPEG before Senior Design Approval; do not convert an "
+                "already-approved file after approval."
+            )
         raise PublishingEligibilityError(
-            "Phase-1 publishing requires a Senior-approved PNG or JPEG creative."
+            "Facebook image publishing requires a Senior-approved PNG or JPEG creative."
         )
     if not platform_is_allowed(post.get("Platform", ""), target):
         raise PublishingEligibilityError(
