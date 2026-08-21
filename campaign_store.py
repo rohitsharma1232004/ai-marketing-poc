@@ -26,9 +26,10 @@ from content_package import (
     REVISION_FIELDS,
     require_supported_calendar_headers,
 )
+from design_brief import normalize_design_brief
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 CAMPAIGN_STATUSES = frozenset(
     {
         "generating",
@@ -767,6 +768,200 @@ class CampaignStore:
             ),
             "approvals": [_approval_from_row(row) for row in approvals],
         }
+
+    def save_design_briefs(
+        self,
+        campaign_id: str,
+        calendar_version_id: str,
+        content_hash: str,
+        briefs: Sequence[Mapping[str, Any]],
+        *,
+        generation_metadata: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Persist one complete design-brief set for a final Senior-approved version."""
+
+        clean_campaign_id = _canonical_uuid(campaign_id, "campaign_id")
+        clean_calendar_id = _canonical_uuid(
+            calendar_version_id, "calendar_version_id"
+        )
+        clean_hash = _sha256_hash(content_hash, "content_hash")
+        if isinstance(briefs, (str, bytes, bytearray)) or not isinstance(briefs, Sequence):
+            raise TypeError("briefs must be a sequence of design brief objects.")
+        brief_values = list(briefs)
+        if not brief_values:
+            raise ValueError("briefs must not be empty.")
+        metadata = _require_mapping(generation_metadata, "generation_metadata")
+        metadata_json = _serialize_json(metadata, "generation_metadata")
+        now = _utc_now()
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (clean_campaign_id,)
+            ).fetchone()
+            if campaign is None:
+                raise RecordNotFound(f"Campaign {clean_campaign_id} was not found.")
+            if campaign["status"] not in {"fully_approved", "approved"}:
+                raise InvalidStatusTransition(
+                    "Design briefs can be generated only after final Senior approval."
+                )
+            calendar = connection.execute(
+                "SELECT * FROM calendar_versions WHERE id=? AND campaign_id=?",
+                (clean_calendar_id, clean_campaign_id),
+            ).fetchone()
+            if calendar is None:
+                raise RecordNotFound(
+                    "That calendar version does not belong to this campaign."
+                )
+            latest = connection.execute(
+                "SELECT id FROM calendar_versions WHERE campaign_id=? "
+                "ORDER BY version DESC LIMIT 1",
+                (clean_campaign_id,),
+            ).fetchone()
+            if latest is None or latest["id"] != clean_calendar_id:
+                raise StoreConflict(
+                    "Design briefs can be generated only for the latest content version."
+                )
+            calculated_hash = _calendar_content_hash(
+                _deserialize_json(calendar["headers_json"]),
+                _deserialize_json(calendar["rows_json"]),
+                _deserialize_json(calendar["client_metadata_json"]),
+                _deserialize_json(calendar["generation_metadata_json"]),
+            )
+            if calculated_hash != calendar["content_hash"]:
+                raise StoreConflict(
+                    "The approved content no longer matches its stored hash."
+                )
+            if calculated_hash != clean_hash:
+                raise StoreConflict(
+                    "The design brief request does not match the approved content hash."
+                )
+            senior_approval = connection.execute(
+                "SELECT 1 FROM approvals WHERE campaign_id=? AND calendar_version_id=? "
+                "AND role='senior' AND decision='approved' AND content_hash=?",
+                (clean_campaign_id, clean_calendar_id, calculated_hash),
+            ).fetchone()
+            if senior_approval is None:
+                raise InvalidStatusTransition(
+                    "A hash-matched Senior approval is required before design briefs."
+                )
+
+            headers = list(
+                require_supported_calendar_headers(
+                    _deserialize_json(calendar["headers_json"])
+                )
+            )
+            stored_rows = _deserialize_json(calendar["rows_json"])
+            content_rows = [
+                (row_index, row)
+                for row_index, row in enumerate(stored_rows)
+                if isinstance(row, list) and len(row) == len(headers)
+            ]
+            if len(brief_values) != len(content_rows):
+                raise ValueError(
+                    "Design brief count must match the approved post count."
+                )
+            duplicate = connection.execute(
+                "SELECT 1 FROM design_briefs WHERE campaign_id=? AND calendar_version_id=? "
+                "LIMIT 1",
+                (clean_campaign_id, clean_calendar_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise StoreConflict(
+                    "Design briefs already exist for this approved content version."
+                )
+
+            format_index = headers.index("Format")
+            for post_number, (raw_brief, (row_index, row)) in enumerate(
+                zip(brief_values, content_rows), start=1
+            ):
+                normalized_brief = normalize_design_brief(
+                    raw_brief,
+                    expected_post_number=post_number,
+                    expected_format=str(row[format_index]),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO design_briefs (
+                        id,campaign_id,calendar_version_id,content_hash,
+                        post_number,row_index,format,brief_json,
+                        generation_metadata_json,created_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        str(uuid4()),
+                        clean_campaign_id,
+                        clean_calendar_id,
+                        calculated_hash,
+                        post_number,
+                        row_index,
+                        normalized_brief["format"],
+                        _serialize_json(normalized_brief, "design_brief"),
+                        metadata_json,
+                        now,
+                    ),
+                )
+
+            event_details = {
+                "calendar_version_id": clean_calendar_id,
+                "content_hash": calculated_hash,
+                "brief_count": len(brief_values),
+            }
+            for key in ("request_id", "provider", "model"):
+                if metadata.get(key) not in (None, ""):
+                    event_details[key] = metadata[key]
+            self._insert_event(
+                connection,
+                campaign_id=clean_campaign_id,
+                event_type="design_briefs_generated",
+                details=event_details,
+                from_status=campaign["status"],
+                to_status=campaign["status"],
+                timestamp=now,
+            )
+            connection.commit()
+
+        return self.list_design_briefs(clean_campaign_id, clean_calendar_id)
+
+    def list_design_briefs(
+        self, campaign_id: str, calendar_version_id: str
+    ) -> list[dict[str, Any]]:
+        """Return hash-verified design briefs for one exact content version."""
+
+        clean_campaign_id = _canonical_uuid(campaign_id, "campaign_id")
+        clean_calendar_id = _canonical_uuid(
+            calendar_version_id, "calendar_version_id"
+        )
+        with self._connection() as connection:
+            calendar = connection.execute(
+                "SELECT * FROM calendar_versions WHERE id=? AND campaign_id=?",
+                (clean_calendar_id, clean_campaign_id),
+            ).fetchone()
+            if calendar is None:
+                raise RecordNotFound(
+                    "That calendar version does not belong to this campaign."
+                )
+            calculated_hash = _calendar_content_hash(
+                _deserialize_json(calendar["headers_json"]),
+                _deserialize_json(calendar["rows_json"]),
+                _deserialize_json(calendar["client_metadata_json"]),
+                _deserialize_json(calendar["generation_metadata_json"]),
+            )
+            if calculated_hash != calendar["content_hash"]:
+                raise StoreConflict(
+                    "The content version no longer matches its stored hash."
+                )
+            rows = connection.execute(
+                "SELECT * FROM design_briefs WHERE campaign_id=? AND calendar_version_id=? "
+                "ORDER BY post_number ASC",
+                (clean_campaign_id, clean_calendar_id),
+            ).fetchall()
+        results = [_design_brief_from_row(row) for row in rows]
+        if any(item["content_hash"] != calculated_hash for item in results):
+            raise StoreConflict(
+                "Stored design briefs do not match the approved content hash."
+            )
+        return results
 
     # Manual client-share audit APIs appear before the automated review APIs.
     def upsert_review_recipient(
@@ -2248,6 +2443,7 @@ class CampaignStore:
             self._ensure_v3_review_schema(connection)
             self._ensure_v5_senior_share_schema(connection)
             self._ensure_v6_senior_change_schema(connection)
+            self._ensure_v7_design_brief_schema(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
 
@@ -2846,6 +3042,37 @@ class CampaignStore:
         )
 
     @staticmethod
+    def _ensure_v7_design_brief_schema(connection: sqlite3.Connection) -> None:
+        """Store designer-ready briefs separately from immutable approved content."""
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS design_briefs (
+                id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL,
+                calendar_version_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL CHECK (
+                    length(content_hash)=64
+                    AND content_hash NOT GLOB '*[^0-9a-f]*'
+                ),
+                post_number INTEGER NOT NULL CHECK (post_number > 0),
+                row_index INTEGER NOT NULL CHECK (row_index >= 0),
+                format TEXT NOT NULL,
+                brief_json TEXT NOT NULL,
+                generation_metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (campaign_id, calendar_version_id, post_number),
+                FOREIGN KEY (campaign_id, calendar_version_id)
+                    REFERENCES calendar_versions(campaign_id, id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS design_briefs_version_idx "
+            "ON design_briefs(campaign_id,calendar_version_id,post_number)"
+        )
+
+    @staticmethod
     def _ensure_v3_indexes_and_triggers(connection: sqlite3.Connection) -> None:
         statements = (
             "CREATE INDEX IF NOT EXISTS review_recipients_campaign_idx "
@@ -3325,6 +3552,21 @@ def _approval_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "feedback": row["feedback"],
         "content_hash": row["content_hash"],
         "decided_at": row["decided_at"],
+    }
+
+
+def _design_brief_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "campaign_id": row["campaign_id"],
+        "calendar_version_id": row["calendar_version_id"],
+        "content_hash": row["content_hash"],
+        "post_number": row["post_number"],
+        "row_index": row["row_index"],
+        "format": row["format"],
+        "brief": _deserialize_json(row["brief_json"]),
+        "generation_metadata": _deserialize_json(row["generation_metadata_json"]),
+        "created_at": row["created_at"],
     }
 
 

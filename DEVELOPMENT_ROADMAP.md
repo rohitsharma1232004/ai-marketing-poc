@@ -63,7 +63,7 @@ Status: planned
 
 ## Milestone 4 — complete content package
 
-Status: **Phase 1 complete; further content types planned**
+Status: **Phase 2 in validation — captions/reel scripts complete; Senior-approved Design Brief Generator implemented**
 
 Completed in Phase 1:
 
@@ -74,10 +74,17 @@ Completed in Phase 1:
 - Increased direct Groq and n8n completion budget for the larger output contract.
 - Preserved legacy seven-column calendar versions without fabricating new fields.
 
+Completed in Phase 2 / local validation:
+
+- Added format-aware Design Brief generation for Image, Carousel, Reel, Video, and Story posts.
+- Design Brief generation unlocks only after final Senior approval of the latest hash-matched content version.
+- Design Briefs are stored separately from immutable approved content and shown in per-post expanders.
+- Added derived `Design Status` without changing the approved content hash.
+
 Next additions within this milestone:
 
-- Carousel slide copy.
-- Design briefs and platform-specific variants.
+- Carousel slide copy as a first-class content field.
+- Platform-specific creative variants.
 - Automatic brand, claim, duplication and platform QA.
 
 ## Milestone 5 — Senior approval and revision
@@ -100,8 +107,8 @@ Status: **content-package review POC complete; production hardening planned**
 
 Status: planned
 
-- Generate complete design briefs from the approved content package.
-- Start with Canva handoff rather than automatic publishing.
+- Use the approved Design Briefs as the creative-production contract.
+- Start with Canva/manual designer handoff rather than automatic publishing.
 - Add approved Canva templates and Autofill where account eligibility allows.
 - Keep an interchangeable design-provider interface for other image/video APIs.
 

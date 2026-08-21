@@ -26,6 +26,15 @@ from content_package import (
     revision_fields_for_row,
     revision_fields_for_rows,
 )
+from design_brief import (
+    DESIGN_BRIEF_SYSTEM_PROMPT,
+    DESIGN_STATUS_BRIEF_READY,
+    DESIGN_STATUS_LOCKED,
+    DESIGN_STATUS_NOT_GENERATED,
+    build_design_brief_prompt,
+    display_design_brief_sections,
+    parse_design_brief_response,
+)
 from generation_providers import (
     DEFAULT_GROQ_API_URL,
     GenerationProviderError,
@@ -312,7 +321,7 @@ provider_label = "n8n Automation" if configured_provider == "n8n" else "Groq Clo
 if not REVIEW_MODE_TOKEN:
     st.title("AI Marketing Content POC")
     st.caption(
-        f"Client details → {provider_label} → Content Package → Senior Approval → Excel Download"
+        f"Client details → {provider_label} → Content Package → Senior Approval → Design Briefs / Excel"
     )
     st.info(
         "Single-approval POC: the generated content package must be approved by a Senior "
@@ -506,8 +515,15 @@ def build_canonical_calendar(model_rows, schedule):
     return calendar_rows
 
 
-def render_calendar_markdown(headers, rows, *, content_status=None):
-    """Render the validated calendar in the weekly format shown in the UI."""
+def render_calendar_markdown(
+    headers,
+    rows,
+    *,
+    content_status=None,
+    design_status_by_post=None,
+    design_status_default=DESIGN_STATUS_NOT_GENERATED,
+):
+    """Render content plus optional app-controlled workflow status columns."""
     display_rows = (
         apply_content_status(
             headers, rows, content_status, week_heading_prefix=WEEK_HEADING_PREFIX
@@ -515,9 +531,15 @@ def render_calendar_markdown(headers, rows, *, content_status=None):
         if content_status
         else [list(map(str, row)) for row in rows]
     )
-    header_line = "| " + " | ".join(headers) + " |"
-    separator_line = "| " + " | ".join(["---"] * len(headers)) + " |"
+    display_headers = list(headers)
+    include_design_status = design_status_by_post is not None
+    if include_design_status:
+        display_headers.append("Design Status")
+
+    header_line = "| " + " | ".join(display_headers) + " |"
+    separator_line = "| " + " | ".join(["---"] * len(display_headers)) + " |"
     lines = []
+    post_number = 0
 
     for row in display_rows:
         if is_week_heading(row):
@@ -527,7 +549,17 @@ def render_calendar_markdown(headers, rows, *, content_status=None):
             lines.append("")
             lines.extend([header_line, separator_line])
         else:
-            lines.append("| " + " | ".join(row) + " |")
+            post_number += 1
+            output_row = list(row)
+            if include_design_status:
+                output_row.append(
+                    str(
+                        design_status_by_post.get(
+                            post_number, design_status_default
+                        )
+                    )
+                )
+            lines.append("| " + " | ".join(output_row) + " |")
 
     return "\n".join(lines).strip()
 
@@ -1685,6 +1717,7 @@ if "result" in st.session_state:
     campaign_record = None
     latest_calendar = None
     client_record = None
+    design_briefs = []
 
     if campaign_store is not None and campaign_id:
         try:
@@ -1696,6 +1729,15 @@ if "result" in st.session_state:
                 "The saved campaign could not be reloaded, but the current "
                 "generated calendar is still shown below."
             )
+
+    if campaign_store is not None and campaign_id and latest_calendar is not None:
+        try:
+            design_briefs = campaign_store.list_design_briefs(
+                campaign_id, latest_calendar["id"]
+            )
+        except PERSISTENCE_EXCEPTIONS as design_load_error:
+            st.warning(f"Design brief status could not be loaded: {design_load_error}")
+            design_briefs = []
 
     if client_record is not None:
         st.caption(f"Client: {client_record['name']}")
@@ -1728,10 +1770,25 @@ if "result" in st.session_state:
                 "approved": CONTENT_STATUS_APPROVED,
             }.get(campaign_record.get("status"))
         try:
+            final_approval_state = (
+                campaign_record is not None
+                and campaign_record.get("status") in {"fully_approved", "approved"}
+            )
+            design_status_by_post = {
+                int(item["post_number"]): DESIGN_STATUS_BRIEF_READY
+                for item in design_briefs
+            }
+            design_status_default = (
+                DESIGN_STATUS_NOT_GENERATED
+                if final_approval_state
+                else DESIGN_STATUS_LOCKED
+            )
             display_result = render_calendar_markdown(
                 latest_calendar["headers"],
                 latest_calendar["rows"],
                 content_status=status_override,
+                design_status_by_post=design_status_by_post,
+                design_status_default=design_status_default,
             )
         except (TypeError, ValueError):
             display_result = st.session_state["result"]
@@ -1784,6 +1841,125 @@ if "result" in st.session_state:
                         ),
                         use_container_width=True,
                     )
+        st.markdown("### Design Brief Generator")
+        st.caption(
+            "Design briefs are generated only from this exact Senior-approved content "
+            "version. Approved content fields remain immutable."
+        )
+
+        if design_briefs:
+            st.success(
+                f"Design briefs ready for {len(design_briefs)} approved post(s)."
+            )
+            for record in design_briefs:
+                brief = record["brief"]
+                with st.expander(
+                    f"Post {record['post_number']} — {record['format']} — View Design Brief"
+                ):
+                    for section_label, section_value in display_design_brief_sections(
+                        brief
+                    ):
+                        st.markdown(f"**{section_label}**")
+                        if isinstance(section_value, list):
+                            for item_index, item in enumerate(section_value, start=1):
+                                st.write(f"{item_index}. {item}")
+                        else:
+                            st.write(section_value)
+        elif campaign_store is not None and latest_calendar is not None:
+            if st.button(
+                "Generate Design Briefs",
+                use_container_width=True,
+                key=f"generate_design_briefs_{latest_calendar['id']}",
+            ):
+                brief_provider = get_app_setting(
+                    "CALENDAR_GENERATION_PROVIDER",
+                    DEFAULT_CALENDAR_GENERATION_PROVIDER,
+                ).strip().lower()
+                brief_groq_key = get_app_setting("GROQ_API_KEY")
+                brief_groq_url = get_app_setting(
+                    "GROQ_API_URL", DEFAULT_GROQ_API_URL
+                )
+                brief_model = get_app_setting("GROQ_MODEL", DEFAULT_GROQ_MODEL)
+                brief_n8n_url = get_app_setting("N8N_CALENDAR_WEBHOOK_URL")
+                brief_n8n_secret = get_app_setting("N8N_WEBHOOK_SECRET")
+
+                brief_config_error = None
+                if brief_provider not in {"groq", "n8n"}:
+                    brief_config_error = (
+                        "CALENDAR_GENERATION_PROVIDER must be either 'groq' or 'n8n'."
+                    )
+                elif brief_provider == "groq" and not brief_groq_key:
+                    brief_config_error = "GROQ_API_KEY is missing."
+                elif brief_provider == "n8n" and not brief_n8n_url:
+                    brief_config_error = "N8N_CALENDAR_WEBHOOK_URL is missing."
+                elif brief_provider == "n8n" and not brief_n8n_secret:
+                    brief_config_error = "N8N_WEBHOOK_SECRET is missing."
+
+                if brief_config_error:
+                    st.error(brief_config_error)
+                else:
+                    brief_request_id = str(uuid4())
+                    brief_label = "n8n" if brief_provider == "n8n" else "Groq"
+                    try:
+                        brief_prompt, source_posts = build_design_brief_prompt(
+                            latest_calendar["headers"],
+                            latest_calendar["rows"],
+                            week_heading_prefix=WEEK_HEADING_PREFIX,
+                            client_metadata=latest_calendar.get("client_metadata"),
+                            campaign_intake=(campaign_record or {}).get("intake", {}),
+                        )
+                    except PERSISTENCE_EXCEPTIONS as brief_prompt_error:
+                        st.error(f"Design brief request could not be prepared: {brief_prompt_error}")
+                    else:
+                        with st.spinner(
+                            f"Generating {len(source_posts)} design brief(s) through "
+                            f"{brief_label} ({brief_model})..."
+                        ):
+                            try:
+                                brief_result = generate_calendar_content(
+                                    provider=brief_provider,
+                                    system_prompt=DESIGN_BRIEF_SYSTEM_PROMPT,
+                                    user_prompt=brief_prompt,
+                                    model=brief_model,
+                                    expected_posts=len(source_posts),
+                                    groq_api_key=brief_groq_key,
+                                    groq_api_url=brief_groq_url,
+                                    n8n_webhook_url=brief_n8n_url,
+                                    n8n_webhook_secret=brief_n8n_secret,
+                                    campaign_id=campaign_id,
+                                    request_id=brief_request_id,
+                                )
+                                parsed_briefs = parse_design_brief_response(
+                                    brief_result.content,
+                                    source_posts=source_posts,
+                                )
+                                campaign_store.save_design_briefs(
+                                    campaign_id,
+                                    latest_calendar["id"],
+                                    latest_calendar["content_hash"],
+                                    parsed_briefs,
+                                    generation_metadata={
+                                        "request_id": brief_result.request_id,
+                                        "provider": brief_result.provider,
+                                        "model": brief_result.model,
+                                        "finish_reason": brief_result.finish_reason,
+                                        "usage": dict(brief_result.usage or {}),
+                                    },
+                                )
+                            except GenerationProviderError as brief_provider_error:
+                                st.error(
+                                    "Design briefs could not be generated: "
+                                    f"{brief_provider_error} Request ID: "
+                                    f"{brief_provider_error.request_id}"
+                                )
+                            except PERSISTENCE_EXCEPTIONS as brief_error:
+                                st.error(f"Design briefs could not be saved safely: {brief_error}")
+                            else:
+                                st.success(
+                                    "Design briefs generated from the approved content package."
+                                )
+                                st.rerun()
+
     elif senior_rejection is not None:
         st.error("Status: Senior requested changes. Excel download remains locked.")
         senior_feedback_text = str(senior_rejection.get("feedback") or "").strip()
