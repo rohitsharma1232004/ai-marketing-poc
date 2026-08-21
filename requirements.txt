@@ -2,4 +2,5 @@ streamlit>=1.61,<2
 requests>=2.31
 pypdf>=6.0,<7
 python-docx>=1.2,<2
+Pillow>=11,<12
 pytest>=8,<9
