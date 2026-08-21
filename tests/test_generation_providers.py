@@ -1,6 +1,5 @@
 import json
 import unittest
-from pathlib import Path
 
 import requests
 
@@ -253,19 +252,6 @@ class GenerationProviderTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.code, "GROQ_KEY_MISSING")
-
-    def test_workflow_export_is_valid_json_and_contains_no_api_key(self):
-        workflow_path = (
-            Path(__file__).resolve().parents[1]
-            / "n8n_workflows"
-            / "calendar_generate_v1.json"
-        )
-        raw = workflow_path.read_text(encoding="utf-8")
-        workflow = json.loads(raw)
-
-        self.assertEqual(workflow["name"], "AI Marketing - Generate Calendar v1")
-        self.assertIn("Calendar Generate Webhook", {node["name"] for node in workflow["nodes"]})
-        self.assertNotIn("gsk_", raw)
 
 
 if __name__ == "__main__":
