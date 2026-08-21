@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import tomllib
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from meta_publisher import (
@@ -21,10 +23,36 @@ from meta_publisher import (
 from publishing_store import PublishingStore
 
 TokenResolver = Callable[[str], str]
+DEFAULT_LOCAL_SECRETS_PATH = Path(__file__).with_name(".streamlit") / "secrets.toml"
 
 
+def resolve_token_from_runtime(credential_ref: str) -> str:
+    """Resolve a token from environment first, then local Streamlit secrets.
+
+    Production should inject environment/managed secrets. Reading
+    `.streamlit/secrets.toml` is a local-development convenience so the worker and
+    Streamlit app can use the same credential reference without copying tokens into
+    SQLite. The token value is never printed or returned anywhere except to the
+    in-process publisher call.
+    """
+
+    ref = str(credential_ref or "").strip()
+    if not ref:
+        return ""
+    environment_value = str(os.getenv(ref, "") or "").strip()
+    if environment_value:
+        return environment_value
+    try:
+        with DEFAULT_LOCAL_SECRETS_PATH.open("rb") as handle:
+            secrets = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""
+    value = secrets.get(ref) if isinstance(secrets, Mapping) else None
+    return str(value or "").strip()
+
+
+# Backward-compatible name for callers/tests that imported the original helper.
 def resolve_token_from_environment(credential_ref: str) -> str:
-    """Resolve a token by secret-name reference without ever printing its value."""
     return str(os.getenv(str(credential_ref or "").strip(), "") or "").strip()
 
 
@@ -32,7 +60,7 @@ def dispatch_claimed_job(
     store: PublishingStore,
     job: Mapping[str, Any],
     *,
-    token_resolver: TokenResolver = resolve_token_from_environment,
+    token_resolver: TokenResolver = resolve_token_from_runtime,
     api_version: str = DEFAULT_META_GRAPH_API_VERSION,
     http_client: Any = None,
 ) -> dict[str, Any]:
@@ -108,7 +136,7 @@ def run_due_jobs(
     db_path: str,
     *,
     limit: int = 10,
-    token_resolver: TokenResolver = resolve_token_from_environment,
+    token_resolver: TokenResolver = resolve_token_from_runtime,
     api_version: str = DEFAULT_META_GRAPH_API_VERSION,
     http_client: Any = None,
 ) -> dict[str, int]:
@@ -144,7 +172,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=10, help="Maximum jobs to claim per run")
     parser.add_argument(
         "--api-version",
-        default=DEFAULT_META_GRAPH_API_VERSION,
+        default=os.getenv("META_GRAPH_API_VERSION", DEFAULT_META_GRAPH_API_VERSION),
         help="Pinned Meta Graph API version, e.g. v25.0",
     )
     return parser
