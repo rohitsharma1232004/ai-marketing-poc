@@ -6,12 +6,14 @@ on:
       - feature/design-brief-generator
     paths:
       - ".github/staging/apply_design_brief.py"
+      - ".github/staging/continue_design_brief.py"
       - ".github/workflows/apply-design-brief.yml"
   pull_request:
     branches:
       - main
     paths:
       - ".github/staging/apply_design_brief.py"
+      - ".github/staging/continue_design_brief.py"
       - ".github/workflows/apply-design-brief.yml"
 
 permissions:
@@ -33,7 +35,9 @@ jobs:
           python-version: "3.11"
 
       - name: Apply deterministic transformation
-        run: python .github/staging/apply_design_brief.py
+        run: |
+          python .github/staging/apply_design_brief.py || true
+          python .github/staging/continue_design_brief.py
 
       - name: Install test dependencies
         run: |
@@ -50,9 +54,10 @@ jobs:
         if: github.event_name == 'push'
         run: |
           rm -f .github/staging/apply_design_brief.py
+          rm -f .github/staging/continue_design_brief.py
           rm -f .github/workflows/apply-design-brief.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A -- app.py campaign_store.py design_brief.py tests/test_design_brief.py tests/test_design_brief_store.py APPROVAL_WORKFLOW.md DEVELOPMENT_ROADMAP.md .github/staging/apply_design_brief.py .github/workflows/apply-design-brief.yml
+          git add -A -- app.py campaign_store.py design_brief.py tests/test_design_brief.py tests/test_design_brief_store.py APPROVAL_WORKFLOW.md DEVELOPMENT_ROADMAP.md .github/staging/apply_design_brief.py .github/staging/continue_design_brief.py .github/workflows/apply-design-brief.yml
           git commit -m "Add Senior-approved design brief generator"
           git push origin HEAD:feature/design-brief-generator
