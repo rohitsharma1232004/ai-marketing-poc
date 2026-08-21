@@ -7,6 +7,12 @@ on:
     paths:
       - ".github/staging/apply_design_brief.py"
       - ".github/workflows/apply-design-brief.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/staging/apply_design_brief.py"
+      - ".github/workflows/apply-design-brief.yml"
 
 permissions:
   contents: write
@@ -41,6 +47,7 @@ jobs:
           git diff --check
 
       - name: Commit tested feature and remove staging files
+        if: github.event_name == 'push'
         run: |
           rm -f .github/staging/apply_design_brief.py
           rm -f .github/workflows/apply-design-brief.yml
