@@ -8,6 +8,7 @@ server-side interaction history for one-shot campaign generation.
 from __future__ import annotations
 
 import base64
+import binascii
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -44,9 +45,12 @@ SUPPORTED_IMAGE_ASPECT_RATIOS = (
     "16:9",
     "21:9",
 )
+SUPPORTED_REFERENCE_IMAGE_MIME_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/webp"}
+)
 MAX_GEMINI_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_GEMINI_TEXT_CHARS = 500_000
-MAX_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -115,7 +119,10 @@ def _post_interaction(
     timeout_seconds: int,
 ) -> Mapping[str, Any]:
     key = _validate_api_key(api_key, request_id)
-    if not re.match(r"^https://generativelanguage\.googleapis\.com/(?:v1|v1beta)/interactions$", api_url.strip()):
+    if not re.match(
+        r"^https://generativelanguage\.googleapis\.com/(?:v1|v1beta)/interactions$",
+        api_url.strip(),
+    ):
         raise GeminiAPIError(
             "GEMINI_INTERACTIONS_URL must use the official Google Generative Language interactions endpoint.",
             request_id=request_id,
@@ -292,10 +299,19 @@ def generate_image(
     model: str = DEFAULT_GEMINI_IMAGE_MODEL,
     aspect_ratio: str = "4:5",
     image_size: str = "1K",
+    reference_image_bytes: bytes | None = None,
+    reference_image_mime_type: str = "",
     request_id: str | None = None,
     api_url: str = DEFAULT_GEMINI_INTERACTIONS_URL,
     http_client: Any = requests,
 ) -> GeminiImageResult:
+    """Generate or revise one image.
+
+    If a reference image is provided, Gemini receives the image plus the text
+    prompt in one interaction. This is used for Senior-requested V1 -> V2 design
+    revisions while keeping approval history immutable in our own database.
+    """
+
     correlation_id = request_id or str(uuid4())
     chosen_model = _model(model, SUPPORTED_GEMINI_IMAGE_MODELS, "Gemini image model")
     ratio = str(aspect_ratio or "").strip()
@@ -313,9 +329,28 @@ def generate_image(
     if len(clean_prompt) > 12_000:
         raise ValueError("Gemini image prompt must be at most 12,000 characters.")
 
+    interaction_input: Any = clean_prompt
+    if reference_image_bytes is not None:
+        if not isinstance(reference_image_bytes, (bytes, bytearray)):
+            raise TypeError("reference_image_bytes must be bytes.")
+        reference_raw = bytes(reference_image_bytes)
+        if not reference_raw or len(reference_raw) > MAX_IMAGE_BYTES:
+            raise ValueError("Reference creative is empty or larger than 12 MB.")
+        reference_mime = str(reference_image_mime_type or "").strip().lower()
+        if reference_mime not in SUPPORTED_REFERENCE_IMAGE_MIME_TYPES:
+            raise ValueError("Reference creative must be PNG, JPEG, or WebP.")
+        interaction_input = [
+            {
+                "type": "image",
+                "data": base64.b64encode(reference_raw).decode("ascii"),
+                "mime_type": reference_mime,
+            },
+            {"type": "text", "text": clean_prompt},
+        ]
+
     payload = {
         "model": chosen_model,
-        "input": clean_prompt,
+        "input": interaction_input,
         "store": False,
         "response_format": {
             "type": "image",
@@ -348,7 +383,7 @@ def generate_image(
             retryable=True,
         )
     mime_type = str(image_block.get("mime_type") or "image/png").lower()
-    if mime_type not in {"image/png", "image/jpeg", "image/webp"}:
+    if mime_type not in SUPPORTED_REFERENCE_IMAGE_MIME_TYPES:
         raise GeminiAPIError(
             "Gemini returned an unsupported image type.",
             request_id=correlation_id,
@@ -356,7 +391,7 @@ def generate_image(
         )
     try:
         image_bytes = base64.b64decode(str(image_block["data"]), validate=True)
-    except (ValueError, TypeError) as error:
+    except (binascii.Error, ValueError, TypeError) as error:
         raise GeminiAPIError(
             "Gemini returned invalid image data.",
             request_id=correlation_id,
