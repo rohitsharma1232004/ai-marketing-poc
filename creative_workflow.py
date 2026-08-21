@@ -29,6 +29,7 @@ DESIGN_CHANGE_FIELDS = (
     "Logo / Branding",
     "CTA Placement",
     "Carousel Slides",
+    "Reel Scenes / B-roll",
     "Thumbnail",
     "Other",
 )
@@ -178,7 +179,7 @@ def build_ai_design_prompt(
             "- Keep all visible text readable, brand-safe, and suitable for the target platform.",
             "- Do not add watermarks or third-party logos.",
             "",
-            *( ["CLIENT CONTEXT:", *context_lines, ""] if context_lines else [] ),
+            *(["CLIENT CONTEXT:", *context_lines, ""] if context_lines else []),
             "APPROVED CONTENT:",
             *source_lines,
             "",
@@ -192,6 +193,22 @@ def build_ai_design_prompt(
     if len(prompt) > MAX_AI_DESIGN_PROMPT_CHARS:
         raise ValueError("The AI design prompt is too large. Reduce design-brief detail.")
     return prompt
+
+
+def _validate_file_signature(extension: str, file_bytes: bytes) -> None:
+    """Reject obvious extension/MIME spoofing before a creative reaches storage."""
+
+    raw = bytes(file_bytes)
+    if extension == ".png":
+        valid = raw.startswith(b"\x89PNG\r\n\x1a\n")
+    elif extension in {".jpg", ".jpeg"}:
+        valid = raw.startswith(b"\xff\xd8\xff")
+    elif extension == ".pdf":
+        valid = raw[:1024].lstrip().startswith(b"%PDF-")
+    else:
+        valid = False
+    if not valid:
+        raise ValueError("The creative file content does not match its declared file type.")
 
 
 def validate_creative_upload(file_name: str, mime_type: str, file_bytes: bytes) -> dict[str, Any]:
@@ -218,6 +235,7 @@ def validate_creative_upload(file_name: str, mime_type: str, file_bytes: bytes) 
         raise ValueError("JPEG file type does not match its MIME type.")
     if extension == ".pdf" and clean_mime != "application/pdf":
         raise ValueError("PDF file type does not match its MIME type.")
+    _validate_file_signature(extension, bytes(file_bytes))
 
     return {
         "file_name": name,
@@ -266,3 +284,46 @@ def publishing_status(latest_assets: Sequence[Mapping[str, Any]], expected_posts
         if approved_posts == set(range(1, expected_posts + 1))
         else PUBLISHING_STATUS_LOCKED
     )
+
+
+def build_design_review_dashboard_rows(
+    design_briefs: Sequence[Mapping[str, Any]],
+    latest_assets: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build one clear dashboard row per approved post/design brief."""
+
+    asset_by_post: dict[int, Mapping[str, Any]] = {}
+    for asset in latest_assets:
+        post_number = int(asset["post_number"])
+        if post_number in asset_by_post:
+            raise ValueError("latest_assets must contain at most one asset per post.")
+        asset_by_post[post_number] = asset
+
+    rows: list[dict[str, Any]] = []
+    seen_posts: set[int] = set()
+    for brief_record in design_briefs:
+        post_number = int(brief_record["post_number"])
+        if post_number < 1 or post_number in seen_posts:
+            raise ValueError("design_briefs must contain unique positive post numbers.")
+        seen_posts.add(post_number)
+        asset = asset_by_post.get(post_number)
+        status = creative_status(asset)
+        rows.append(
+            {
+                "post_number": post_number,
+                "format": str(brief_record.get("format") or "").strip(),
+                "status": status,
+                "asset_version": int(asset["asset_version"]) if asset else None,
+                "file_name": str(asset.get("file_name") or "") if asset else "",
+                "active_review_link": bool(asset.get("active_review_link")) if asset else False,
+                "active_review_expires_at": str(asset.get("active_review_expires_at") or "") if asset else "",
+                "latest_decision": str(asset.get("latest_decision") or "") if asset else "",
+                "approver_name": str(asset.get("design_approver_name") or "") if asset else "",
+                "approver_email": str(asset.get("design_approver_email") or "") if asset else "",
+                "decided_at": str(asset.get("design_decided_at") or "") if asset else "",
+                "change_fields": list(asset.get("design_change_fields") or []) if asset else [],
+                "feedback": str(asset.get("design_feedback") or "") if asset else "",
+                "action_required": status == CREATIVE_STATUS_CHANGES_REQUESTED,
+            }
+        )
+    return rows
