@@ -1,5 +1,6 @@
 import unittest
 
+from content_package import CONTENT_PACKAGE_HEADERS, CONTENT_STATUS_READY
 from revision_logic import (
     REVISION_FIELDS,
     build_field_revision_prompt,
@@ -20,6 +21,18 @@ ROWS = [
 HEADERS = [
     "Date", "Platform", "Pillar", "Format", "Content Idea", "SEO Keyword Focus", "CTA"
 ]
+PACKAGE_ROWS = [
+    [PREFIX + "Week 1"],
+    [
+        "20 Aug 2026", "Instagram", "Educational", "Reel", "Old idea", "old keyword",
+        "Old CTA", "Old caption", "Old reel script", CONTENT_STATUS_READY,
+    ],
+    [
+        "22 Aug 2026", "Facebook", "Brand Awareness", "Image", "Second idea",
+        "second keyword", "Second CTA", "Second caption", "Not applicable",
+        CONTENT_STATUS_READY,
+    ],
+]
 
 
 class RevisionLogicTests(unittest.TestCase):
@@ -28,6 +41,9 @@ class RevisionLogicTests(unittest.TestCase):
         self.assertEqual([item["post_number"] for item in posts], [1, 2])
         self.assertEqual([item["row_index"] for item in posts], [1, 2])
         self.assertIn("Old idea", posts[0]["label"])
+
+        package_posts = list_reviewable_posts(PACKAGE_ROWS, week_heading_prefix=PREFIX)
+        self.assertEqual([item["row_index"] for item in package_posts], [1, 2])
 
     def test_merge_revised_post_preserves_schedule_and_mix_columns(self):
         merged = merge_revised_post(
@@ -107,8 +123,63 @@ class RevisionLogicTests(unittest.TestCase):
         self.assertIn("Include Sector 88 where relevant.", prompt)
         self.assertIn("Change ONLY these field(s): SEO Keyword Focus", prompt)
 
+    def test_package_caption_only_revision_preserves_script_and_status(self):
+        revised = [[
+            "wrong date", "wrong platform", "wrong pillar", "wrong format", "wrong idea",
+            "wrong keyword", "wrong cta", "Better caption", "Wrong script", "Wrong status",
+        ]]
+        merged = merge_revised_fields(
+            PACKAGE_ROWS,
+            target_row_indices=[1],
+            revised_rows=revised,
+            fields_to_change=["Caption"],
+            headers=CONTENT_PACKAGE_HEADERS,
+        )
+        self.assertEqual(merged[1][7], "Better caption")
+        self.assertEqual(merged[1][8], PACKAGE_ROWS[1][8])
+        self.assertEqual(merged[1][9], CONTENT_STATUS_READY)
+        self.assertEqual(merged[1][:7], PACKAGE_ROWS[1][:7])
+
+    def test_non_reel_script_is_preserved_even_for_whole_calendar_script_revision(self):
+        revised = [
+            [*PACKAGE_ROWS[1][:8], "Better reel script", "Wrong status"],
+            [*PACKAGE_ROWS[2][:8], "Model invented image script", "Wrong status"],
+        ]
+        merged = merge_revised_fields(
+            PACKAGE_ROWS,
+            target_row_indices=[1, 2],
+            revised_rows=revised,
+            fields_to_change=["Reel Script"],
+            headers=CONTENT_PACKAGE_HEADERS,
+        )
+        self.assertEqual(merged[1][8], "Better reel script")
+        self.assertEqual(merged[2][8], "Not applicable")
+        self.assertEqual(merged[1][9], CONTENT_STATUS_READY)
+        self.assertEqual(merged[2][9], CONTENT_STATUS_READY)
+
+    def test_package_prompt_keeps_status_immutable(self):
+        prompt = build_field_revision_prompt(
+            headers=CONTENT_PACKAGE_HEADERS,
+            current_rows=[PACKAGE_ROWS[1]],
+            fields_to_change=["Caption", "Reel Script"],
+            senior_feedback="Make the hook sharper.",
+        )
+        self.assertIn("Content Status", prompt)
+        self.assertIn("Change Reel Script only for rows whose Format is Reel or Video", prompt)
+
+    def test_legacy_calendar_rejects_new_field_revision(self):
+        with self.assertRaises(ValueError):
+            build_field_revision_prompt(
+                headers=HEADERS,
+                current_rows=[ROWS[1]],
+                fields_to_change=["Caption"],
+                senior_feedback="Rewrite it.",
+            )
+
     def test_revision_fields_are_restricted(self):
         self.assertEqual(normalize_revision_fields(list(REVISION_FIELDS)), REVISION_FIELDS)
+        self.assertIn("Caption", REVISION_FIELDS)
+        self.assertIn("Reel Script", REVISION_FIELDS)
         with self.assertRaises(ValueError):
             normalize_revision_fields(["Platform"])
         with self.assertRaises(ValueError):

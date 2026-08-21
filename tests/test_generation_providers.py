@@ -237,6 +237,7 @@ class GenerationProviderTests(unittest.TestCase):
         _, call = client.calls[0]
         self.assertEqual(call["json"]["reasoning_effort"], "low")
         self.assertFalse(call["json"]["include_reasoning"])
+        self.assertEqual(call["json"]["max_completion_tokens"], 8192)
         self.assertEqual(call["timeout"], (5, 90))
 
     def test_direct_groq_requires_key(self):

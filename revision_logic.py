@@ -5,31 +5,35 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-REVISION_FIELDS = (
-    "Content Idea",
-    "SEO Keyword Focus",
-    "CTA",
+from content_package import (
+    CONTENT_PACKAGE_HEADERS,
+    LEGACY_CALENDAR_HEADERS,
+    REEL_SCRIPT_FORMATS,
+    REVISION_FIELDS,
+    require_supported_calendar_headers,
 )
-_FIELD_INDEX = {name: index for index, name in enumerate(
-    ("Date", "Platform", "Pillar", "Format", *REVISION_FIELDS)
-)}
 
 
 def list_reviewable_posts(
     rows: Sequence[Sequence[Any]],
     *,
     week_heading_prefix: str,
-    expected_columns: int = 7,
+    expected_columns: int | None = None,
 ) -> list[dict[str, Any]]:
     """Return stable row positions for actual posts, excluding week headings."""
 
+    allowed_counts = (
+        {int(expected_columns)}
+        if expected_columns is not None
+        else {len(LEGACY_CALENDAR_HEADERS), len(CONTENT_PACKAGE_HEADERS)}
+    )
     posts: list[dict[str, Any]] = []
     post_number = 0
     for row_index, raw_row in enumerate(rows):
         row = [str(value) for value in raw_row]
         if len(row) == 1 and row[0].startswith(week_heading_prefix):
             continue
-        if len(row) != expected_columns:
+        if len(row) not in allowed_counts:
             raise ValueError("A calendar content row has an unexpected column count.")
         post_number += 1
         idea = row[4].strip() if len(row) > 4 else ""
@@ -70,15 +74,18 @@ def build_field_revision_prompt(
 ) -> str:
     """Build a prompt that may change only explicitly requested content fields."""
 
-    header_values = [str(value).strip() for value in headers]
-    if len(header_values) != 7:
-        raise ValueError("Field-level revision requires the seven-column calendar format.")
-
+    header_values = list(require_supported_calendar_headers(headers))
     row_values = [[str(value).strip() for value in row] for row in current_rows]
-    if not row_values or any(len(row) != 7 for row in row_values):
-        raise ValueError("Field-level revision requires one or more seven-column posts.")
+    if not row_values or any(len(row) != len(header_values) for row in row_values):
+        raise ValueError("Field-level revision rows must match the calendar headers.")
 
     selected_fields = normalize_revision_fields(fields_to_change)
+    unavailable = [field for field in selected_fields if field not in header_values]
+    if unavailable:
+        raise ValueError(
+            "This calendar version does not contain: " + ", ".join(unavailable) + "."
+        )
+
     feedback = str(senior_feedback or "").strip()
     if not feedback:
         raise ValueError("Senior required-changes description is required.")
@@ -112,9 +119,24 @@ def build_field_revision_prompt(
     selected_text = ", ".join(selected_fields)
     protected_fields = [field for field in header_values if field not in selected_fields]
     additional_section = additional or "No additional team instruction."
+    exact_header = " | ".join(header_values)
+
+    format_rules = ""
+    if "Caption" in selected_fields:
+        format_rules += (
+            "\n- Caption must remain publish-ready, natural for the platform, and consistent "
+            "with the approved idea, CTA, audience, tone, and language."
+        )
+    if "Reel Script" in selected_fields:
+        format_rules += (
+            "\n- Change Reel Script only for rows whose Format is Reel or Video. For every "
+            "other format, copy the existing Reel Script value exactly."
+            "\n- Keep Reel/Video scripts concise and production-friendly with a hook, short "
+            "scene/beat sequence, and closing CTA in one table cell."
+        )
 
     return f"""
-Revise the content-calendar row(s) below using the Senior's required changes.
+Revise the content-package row(s) below using the Senior's required changes.
 
 Client context:
 {context_lines}
@@ -132,7 +154,7 @@ Current row(s):
 {current_table}
 
 Return exactly one Markdown table with this exact header:
-Date | Platform | Pillar | Format | Content Idea | SEO Keyword Focus | CTA
+{exact_header}
 
 Rules:
 - Return exactly {len(row_values)} content row(s), in the same order as the input.
@@ -143,8 +165,23 @@ Rules:
 - Do not invent offers, prices, statistics, testimonials, property details, or unsupported claims.
 - Keep the revision concise and suitable for the stated audience, tone, goal, and language.
 - Do not use the `|` character inside a table cell.
-- Return no commentary before or after the table.
+- Return no commentary before or after the table.{format_rules}
 """.strip()
+
+
+def _infer_headers_for_target_rows(
+    rows: Sequence[Sequence[Any]], target_row_indices: Sequence[int]
+) -> tuple[str, ...]:
+    lengths = {
+        len(rows[index])
+        for index in target_row_indices
+        if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(rows)
+    }
+    if lengths == {len(LEGACY_CALENDAR_HEADERS)}:
+        return LEGACY_CALENDAR_HEADERS
+    if lengths == {len(CONTENT_PACKAGE_HEADERS)}:
+        return CONTENT_PACKAGE_HEADERS
+    raise ValueError("Could not infer a supported calendar format for the revision.")
 
 
 def merge_revised_fields(
@@ -153,7 +190,8 @@ def merge_revised_fields(
     target_row_indices: Sequence[int],
     revised_rows: Sequence[Sequence[Any]],
     fields_to_change: Sequence[str],
-    expected_columns: int = 7,
+    headers: Sequence[str] | None = None,
+    expected_columns: int | None = None,
 ) -> list[list[str]]:
     """Merge only requested fields into targeted posts and preserve everything else."""
 
@@ -167,18 +205,40 @@ def merge_revised_fields(
     if len(set(target_indices)) != len(target_indices):
         raise ValueError("Target post rows must be unique.")
 
-    merged = [list(map(str, row)) for row in rows]
-    for row_index, raw_replacement in zip(target_indices, replacements):
+    for row_index in target_indices:
         if not isinstance(row_index, int) or isinstance(row_index, bool):
             raise TypeError("target row indices must be integers.")
-        if row_index < 0 or row_index >= len(merged):
+        if row_index < 0 or row_index >= len(rows):
             raise ValueError("A target row index is outside the calendar.")
+
+    header_values = (
+        require_supported_calendar_headers(headers)
+        if headers is not None
+        else _infer_headers_for_target_rows(rows, target_indices)
+    )
+    if expected_columns is not None and int(expected_columns) != len(header_values):
+        raise ValueError("expected_columns does not match the calendar headers.")
+    unavailable = [field for field in selected_fields if field not in header_values]
+    if unavailable:
+        raise ValueError(
+            "This calendar version does not contain: " + ", ".join(unavailable) + "."
+        )
+
+    field_indices = {field: header_values.index(field) for field in selected_fields}
+    format_index = header_values.index("Format")
+    merged = [list(map(str, row)) for row in rows]
+    for row_index, raw_replacement in zip(target_indices, replacements):
         original = [str(value).strip() for value in merged[row_index]]
         replacement = [str(value).strip().replace("|", "/") for value in raw_replacement]
-        if len(original) != expected_columns or len(replacement) != expected_columns:
-            raise ValueError("Field-level revision requires seven columns.")
+        if len(original) != len(header_values) or len(replacement) != len(header_values):
+            raise ValueError("Field-level revision rows must match the calendar headers.")
         for field in selected_fields:
-            index = _FIELD_INDEX[field]
+            if (
+                field == "Reel Script"
+                and original[format_index].strip().casefold() not in REEL_SCRIPT_FORMATS
+            ):
+                continue
+            index = field_indices[field]
             if not replacement[index]:
                 raise ValueError(f"The regenerated {field} field must not be empty.")
             original[index] = replacement[index]
@@ -194,12 +254,14 @@ def build_selected_post_revision_prompt(
     client_metadata: Mapping[str, Any] | None = None,
     campaign_intake: Mapping[str, Any] | None = None,
 ) -> str:
-    """Backward-compatible wrapper that revises all three content fields."""
+    """Backward-compatible wrapper that revises all fields present in that version."""
 
+    header_values = require_supported_calendar_headers(headers)
+    fields = [field for field in REVISION_FIELDS if field in header_values]
     return build_field_revision_prompt(
-        headers=headers,
+        headers=header_values,
         current_rows=[current_row],
-        fields_to_change=REVISION_FIELDS,
+        fields_to_change=fields,
         senior_feedback=senior_feedback,
         client_metadata=client_metadata,
         campaign_intake=campaign_intake,
@@ -218,10 +280,18 @@ def merge_revised_post(
 
     if preserved_columns != 4:
         raise ValueError("Only the first four calendar columns may be preserved here.")
+    if expected_columns == len(LEGACY_CALENDAR_HEADERS):
+        headers = LEGACY_CALENDAR_HEADERS
+    elif expected_columns == len(CONTENT_PACKAGE_HEADERS):
+        headers = CONTENT_PACKAGE_HEADERS
+    else:
+        raise ValueError("Unsupported expected column count.")
+    fields = [field for field in REVISION_FIELDS if field in headers]
     return merge_revised_fields(
         rows,
         target_row_indices=[row_index],
         revised_rows=[revised_row],
-        fields_to_change=REVISION_FIELDS,
+        fields_to_change=fields,
+        headers=headers,
         expected_columns=expected_columns,
     )

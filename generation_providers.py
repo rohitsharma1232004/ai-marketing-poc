@@ -145,7 +145,7 @@ def _generate_with_groq(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.3,
-        "max_completion_tokens": 4096,
+        "max_completion_tokens": 8192,
     }
     if model.startswith("openai/gpt-oss-"):
         payload.update({"reasoning_effort": "low", "include_reasoning": False})

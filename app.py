@@ -14,6 +14,18 @@ from docx import Document
 from pypdf import PdfReader
 
 from campaign_store import CampaignStore, CampaignStoreError
+from content_package import (
+    CONTENT_PACKAGE_HEADERS,
+    CONTENT_STATUS_APPROVED,
+    CONTENT_STATUS_NEEDS_CHANGES,
+    CONTENT_STATUS_READY,
+    GENERATION_HEADERS,
+    apply_content_status,
+    normalize_generated_content_row,
+    require_supported_calendar_headers,
+    revision_fields_for_row,
+    revision_fields_for_rows,
+)
 from generation_providers import (
     DEFAULT_GROQ_API_URL,
     GenerationProviderError,
@@ -36,15 +48,7 @@ DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 # GROQ_API_KEY is read from the environment or .streamlit/secrets.toml.
 DEFAULT_CALENDAR_GENERATION_PROVIDER = "groq"
 
-CONTENT_CALENDAR_HEADERS = [
-    "Date",
-    "Platform",
-    "Pillar",
-    "Format",
-    "Content Idea",
-    "SEO Keyword Focus",
-    "CTA",
-]
+CONTENT_CALENDAR_HEADERS = list(CONTENT_PACKAGE_HEADERS)
 FORMAT_OPTIONS = ("Image", "Carousel", "Reel", "Video", "Story")
 PILLAR_OPTIONS = (
     "Educational",
@@ -308,10 +312,10 @@ provider_label = "n8n Automation" if configured_provider == "n8n" else "Groq Clo
 if not REVIEW_MODE_TOKEN:
     st.title("AI Marketing Content POC")
     st.caption(
-        f"Client details → {provider_label} → Content Calendar → Senior Approval → Excel Download"
+        f"Client details → {provider_label} → Content Package → Senior Approval → Excel Download"
     )
     st.info(
-        "Single-approval POC: the generated calendar must be approved by a Senior "
+        "Single-approval POC: the generated content package must be approved by a Senior "
         "before Excel download is unlocked. Client approval and WhatsApp delivery are disabled."
     )
 
@@ -372,11 +376,10 @@ def is_markdown_separator(cells):
     )
 
 
-def parse_markdown_table(text):
-    """Strictly parse the model table instead of silently fixing malformed rows."""
-    expected_headings = [
-        normalized_heading(value) for value in CONTENT_CALENDAR_HEADERS
-    ]
+def parse_markdown_table(text, expected_headers=None):
+    """Strictly parse one model table against the caller-selected column contract."""
+    required_headers = list(expected_headers or CONTENT_CALENDAR_HEADERS)
+    expected_headings = [normalized_heading(value) for value in required_headers]
     data_rows = []
     table_header_found = False
 
@@ -397,25 +400,25 @@ def parse_markdown_table(text):
         if not table_header_found:
             continue
 
-        if len(cells) != len(CONTENT_CALENDAR_HEADERS):
+        if len(cells) != len(required_headers):
             raise ValueError(
-                f"Calendar row {line_number} has {len(cells)} columns; "
-                f"expected {len(CONTENT_CALENDAR_HEADERS)}."
+                f"Content row {line_number} has {len(cells)} columns; "
+                f"expected {len(required_headers)}."
             )
         if row_headings and row_headings[0] == expected_headings[0]:
             raise ValueError(
-                "The calendar header must exactly match the required seven columns."
+                "The content-package header must exactly match the required columns."
             )
         if not any(cells):
-            raise ValueError(f"Calendar row {line_number} is empty.")
+            raise ValueError(f"Content row {line_number} is empty.")
         blank_columns = [
-            CONTENT_CALENDAR_HEADERS[index]
+            required_headers[index]
             for index, value in enumerate(cells)
             if not value.strip()
         ]
         if blank_columns:
             raise ValueError(
-                f"Calendar row {line_number} has blank required cells: "
+                f"Content row {line_number} has blank required cells: "
                 + ", ".join(blank_columns)
                 + "."
             )
@@ -427,9 +430,9 @@ def parse_markdown_table(text):
             "The response did not contain the required Markdown table header."
         )
     if not data_rows:
-        raise ValueError("The response did not contain any calendar rows.")
+        raise ValueError("The response did not contain any content rows.")
 
-    return CONTENT_CALENDAR_HEADERS.copy(), data_rows
+    return required_headers.copy(), data_rows
 
 
 def format_calendar_date(value):
@@ -484,31 +487,39 @@ def build_canonical_calendar(model_rows, schedule):
     calendar_rows = []
     current_week = None
     for model_row, schedule_item in zip(model_rows, schedule):
-        if len(model_row) != len(CONTENT_CALENDAR_HEADERS):
-            raise ValueError("A generated calendar row does not have seven columns.")
+        if len(model_row) != len(GENERATION_HEADERS):
+            raise ValueError(
+                "A generated content-package row does not have the required columns."
+            )
 
         week_title = schedule_item["week_title"]
         if week_title != current_week:
             calendar_rows.append([WEEK_HEADING_PREFIX + week_title])
             current_week = week_title
 
-        cleaned_row = [
-            re.sub(r"\s+", " ", str(value)).strip().replace("|", "/")
-            for value in model_row
-        ]
-        cleaned_row[0] = schedule_item["date_label"]
-        calendar_rows.append(cleaned_row)
+        calendar_rows.append(
+            normalize_generated_content_row(
+                model_row, date_label=schedule_item["date_label"]
+            )
+        )
 
     return calendar_rows
 
 
-def render_calendar_markdown(headers, rows):
+def render_calendar_markdown(headers, rows, *, content_status=None):
     """Render the validated calendar in the weekly format shown in the UI."""
+    display_rows = (
+        apply_content_status(
+            headers, rows, content_status, week_heading_prefix=WEEK_HEADING_PREFIX
+        )
+        if content_status
+        else [list(map(str, row)) for row in rows]
+    )
     header_line = "| " + " | ".join(headers) + " |"
     separator_line = "| " + " | ".join(["---"] * len(headers)) + " |"
     lines = []
 
-    for row in rows:
+    for row in display_rows:
         if is_week_heading(row):
             if lines:
                 lines.append("")
@@ -557,16 +568,15 @@ def load_campaign_into_session(store, campaign_id):
 
 def validate_calendar_for_export(headers, rows, schedule):
     """Protect approval/export from incomplete or tampered calendar state."""
-    if headers != CONTENT_CALENDAR_HEADERS:
-        raise ValueError("The calendar headers are not valid.")
+    required_headers = list(require_supported_calendar_headers(headers))
 
     data_rows = [row for row in rows if not is_week_heading(row)]
     if len(data_rows) != len(schedule):
         raise ValueError("The calendar does not contain the requested number of posts.")
 
     for index, (row, schedule_item) in enumerate(zip(data_rows, schedule), start=1):
-        if len(row) != len(CONTENT_CALENDAR_HEADERS):
-            raise ValueError(f"Calendar row {index} does not have seven columns.")
+        if len(row) != len(required_headers):
+            raise ValueError(f"Calendar row {index} does not match its headers.")
         if any(not str(value).strip() for value in row):
             raise ValueError(f"Calendar row {index} contains a blank required cell.")
         if row[0] != schedule_item["date_label"]:
@@ -803,6 +813,22 @@ def write_simple_xlsx(path, client_data, headers, rows):
   <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 </styleSheet>'''
 
+    width_by_header = {
+        "Date": 16,
+        "Platform": 22,
+        "Pillar": 22,
+        "Format": 18,
+        "Content Idea": 52,
+        "SEO Keyword Focus": 32,
+        "CTA": 30,
+        "Caption": 70,
+        "Reel Script": 90,
+        "Content Status": 24,
+    }
+    calendar_column_widths = [
+        width_by_header.get(str(header), 24) for header in headers
+    ]
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("[Content_Types].xml", content_types)
@@ -814,7 +840,7 @@ def write_simple_xlsx(path, client_data, headers, rows):
             "xl/worksheets/sheet1.xml",
             sheet_xml(
                 cal_rows,
-                [16, 22, 22, 18, 52, 32, 30],
+                calendar_column_widths,
                 WEEK_HEADING_PREFIX,
                 headers,
                 frozen_rows=2 if has_week_sections else 1,
@@ -848,6 +874,12 @@ def ensure_calendar_excel(store, campaign_id):
     client = store.get_client(campaign["client_id"])
     schedule = list(campaign.get("intake", {}).get("schedule", []))
     validate_calendar_for_export(calendar["headers"], calendar["rows"], schedule)
+    export_rows = apply_content_status(
+        calendar["headers"],
+        calendar["rows"],
+        CONTENT_STATUS_APPROVED,
+        week_heading_prefix=WEEK_HEADING_PREFIX,
+    )
 
     export_metadata = build_base_export_metadata(calendar, client)
     export_metadata.update(
@@ -873,7 +905,7 @@ def ensure_calendar_excel(store, campaign_id):
             output_file,
             export_metadata,
             calendar["headers"],
-            calendar["rows"],
+            export_rows,
         )
     return output_file, campaign, calendar, client
 
@@ -961,14 +993,24 @@ def render_senior_review_portal(store, raw_token):
             selected_post = next(
                 item for item in reviewable_posts if item["label"] == selected_label
             )
+            available_revision_fields = revision_fields_for_row(
+                calendar["headers"], selected_post["row"]
+            )
+        else:
+            available_revision_fields = revision_fields_for_rows(
+                calendar["headers"],
+                [item["row"] for item in reviewable_posts],
+            )
         selected_fields = st.multiselect(
             "Which field(s) need changes?",
-            list(REVISION_FIELDS),
+            list(available_revision_fields),
             default=[],
             key=f"senior_change_fields_{link['id']}",
             help=(
-                "Only selected fields will be regenerated. Date, Platform, Pillar, "
-                "and Format remain unchanged."
+                "Only selected fields will be regenerated. Caption is available for the "
+                "current content-package format; Reel Script is available only when a "
+                "Reel or Video is in scope. Date, Platform, Pillar, Format, and Content "
+                "Status remain unchanged."
             ),
         )
         required_changes = st.text_area(
@@ -1037,7 +1079,7 @@ def render_senior_review_portal(store, raw_token):
         return
 
     if result["approval"]["decision"] == "approved":
-        st.success("Calendar approved successfully. The campaign owner can now download Excel.")
+        st.success("Content package approved successfully. The campaign owner can now download Excel.")
     else:
         saved_change = result.get("change_request") or {}
         scope_text = (
@@ -1165,7 +1207,7 @@ with st.form("client_form"):
         ),
     )
 
-    submitted = st.form_submit_button("Generate Content Calendar", use_container_width=True)
+    submitted = st.form_submit_button("Generate Content Package", use_container_width=True)
 
 if submitted:
     for key in CALENDAR_SESSION_KEYS:
@@ -1296,21 +1338,29 @@ Required Pillar Mix:
 
 Return exactly {posts} content rows in the same order as the fixed posting sequence.
 Return one Markdown table, with this exact header and no other columns:
-  Date | Platform | Pillar | Format | Content Idea | SEO Keyword Focus | CTA
+  Date | Platform | Pillar | Format | Content Idea | SEO Keyword Focus | CTA | Caption | Reel Script
 
 Rules:
 - Do not invent offers, prices, statistics, testimonials, property details, or claims.
 - Put the matching date from the fixed posting sequence in every Date cell.
-- Write Content Idea, SEO Keyword Focus, and CTA in {language}.
+- Write Content Idea, SEO Keyword Focus, CTA, Caption, and Reel Script in {language}.
 - For Hinglish, use natural Roman-script Hinglish.
 - Keep the table headers and requested Format and Pillar labels unchanged.
 - When a format or pillar mix is specified, use its labels exactly and satisfy
   every requested count.
 - Give each row one concise, relevant SEO keyword focus phrase.
+- Every post requires a publish-ready Caption of roughly 20-45 words, aligned to
+  the approved idea, platform, audience, tone, and CTA.
+- For Reel or Video rows, Reel Script must be roughly 45-75 words and stay in one
+  table cell using a compact structure such as: Hook: ...; Scene 1: ...; Scene 2: ...; CTA: ...
+- For Image, Carousel, or Story rows, Reel Script must be exactly: Not applicable
+- Do not output Content Status. The application controls that field so the model
+  cannot mark its own content approved.
 - Keep the output concise.
 - Do not add week headings; the application creates the weekly display format.
 - Do not use the `|` character inside a table cell.
-- Do not add extra suggestions after the calendar.
+- Do not add line breaks inside an individual table cell.
+- Do not add extra suggestions after the content package.
 '''
 
     generation_provider = get_app_setting(
@@ -1506,8 +1556,9 @@ Rules:
                     st.error(str(configuration_error))
                 else:
                     try:
-                        calendar_headers, model_rows = parse_markdown_table(
-                            generation_result.content
+                        _generated_headers, model_rows = parse_markdown_table(
+                            generation_result.content,
+                            expected_headers=GENERATION_HEADERS,
                         )
                         validate_generated_content_mix(
                             model_rows, 3, format_mix, "Format"
@@ -1516,8 +1567,11 @@ Rules:
                             model_rows, 2, pillar_mix, "Pillar"
                         )
                         calendar_rows = build_canonical_calendar(model_rows, schedule)
+                        calendar_headers = list(CONTENT_PACKAGE_HEADERS)
                         rendered_calendar = render_calendar_markdown(
-                            calendar_headers, calendar_rows
+                            calendar_headers,
+                            calendar_rows,
+                            content_status=CONTENT_STATUS_READY,
                         )
                     except ValueError as validation_error:
                         persist_generation_outcome(
@@ -1592,7 +1646,7 @@ Rules:
                             st.session_state["status"] = "pending_senior_review"
                             st.session_state.pop("excel_file", None)
                             st.success(
-                                "Content calendar generated and saved. It is now pending Senior approval."
+                                "Content package generated and saved. It is now pending Senior approval."
                             )
 
 if campaign_store is not None:
@@ -1626,7 +1680,7 @@ if campaign_store is not None:
 
 if "result" in st.session_state:
     st.divider()
-    st.subheader("Generated Content Calendar")
+    st.subheader("Generated Content Package")
     campaign_id = st.session_state.get("campaign_id")
     campaign_record = None
     latest_calendar = None
@@ -1660,7 +1714,28 @@ if "result" in st.session_state:
             f"Request ID: {st.session_state['generation_request_id']}"
         )
 
-    st.markdown(st.session_state["result"])
+    display_result = st.session_state["result"]
+    if latest_calendar is not None:
+        status_override = None
+        if campaign_record is not None:
+            status_override = {
+                "pending_senior_review": CONTENT_STATUS_READY,
+                "pending_review": CONTENT_STATUS_READY,
+                "revision_required": CONTENT_STATUS_NEEDS_CHANGES,
+                "rejected": CONTENT_STATUS_NEEDS_CHANGES,
+                "fully_approved": CONTENT_STATUS_APPROVED,
+                "pending_client_review": CONTENT_STATUS_APPROVED,
+                "approved": CONTENT_STATUS_APPROVED,
+            }.get(campaign_record.get("status"))
+        try:
+            display_result = render_calendar_markdown(
+                latest_calendar["headers"],
+                latest_calendar["rows"],
+                content_status=status_override,
+            )
+        except (TypeError, ValueError):
+            display_result = st.session_state["result"]
+    st.markdown(display_result)
 
     senior_approval = None
     senior_rejection = None
@@ -1700,7 +1775,7 @@ if "result" in st.session_state:
             if excel_path.exists():
                 with open(excel_path, "rb") as excel_file:
                     st.download_button(
-                        "Download Approved Content Calendar Excel",
+                        "Download Approved Content Package Excel",
                         data=excel_file.read(),
                         file_name=excel_path.name,
                         mime=(
@@ -1839,9 +1914,10 @@ if "result" in st.session_state:
                                         request_id=revision_request_id,
                                     )
                                     revised_headers, revised_rows = parse_markdown_table(
-                                        revision_result.content
+                                        revision_result.content,
+                                        expected_headers=latest_calendar["headers"],
                                     )
-                                    if revised_headers != CONTENT_CALENDAR_HEADERS:
+                                    if revised_headers != list(latest_calendar["headers"]):
                                         raise ValueError(
                                             "The regenerated response returned an unexpected header."
                                         )
@@ -1856,6 +1932,7 @@ if "result" in st.session_state:
                                         ],
                                         revised_rows=revised_rows,
                                         fields_to_change=fields_to_change,
+                                        headers=latest_calendar["headers"],
                                     )
                                     validate_calendar_for_export(
                                         latest_calendar["headers"],
