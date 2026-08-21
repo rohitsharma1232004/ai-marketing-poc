@@ -16,11 +16,11 @@ def _approved_post():
     }
 
 
-def _creative():
+def _creative(mime_type="image/jpeg"):
     return {
         "id": "asset-1",
         "format": "Image",
-        "mime_type": "image/png",
+        "mime_type": mime_type,
         "file_sha256": "a" * 64,
     }
 
@@ -39,10 +39,32 @@ def test_publishable_image_requires_hash_matched_design_approval():
         creative_asset=_creative(),
         design_approval=_approval(),
         platform="instagram",
-        public_media_url="https://cdn.example.com/creative.png",
+        public_media_url="https://cdn.example.com/creative.jpg",
     )
     assert result["caption"] == "Approved caption"
     assert result["platform"] == "instagram"
+
+
+def test_instagram_png_is_blocked_before_publish():
+    with pytest.raises(PublishingEligibilityError, match="JPEG"):
+        validate_publishable_image(
+            approved_post=_approved_post(),
+            creative_asset=_creative("image/png"),
+            design_approval=_approval(),
+            platform="instagram",
+            public_media_url="https://cdn.example.com/creative.png",
+        )
+
+
+def test_facebook_png_remains_supported():
+    result = validate_publishable_image(
+        approved_post=_approved_post(),
+        creative_asset=_creative("image/png"),
+        design_approval=_approval(),
+        platform="facebook",
+        public_media_url="https://cdn.example.com/creative.png",
+    )
+    assert result["platform"] == "facebook"
 
 
 def test_rejected_or_wrong_hash_creative_cannot_publish():
@@ -54,7 +76,7 @@ def test_rejected_or_wrong_hash_creative_cannot_publish():
             creative_asset=_creative(),
             design_approval=approval,
             platform="facebook",
-            public_media_url="https://cdn.example.com/creative.png",
+            public_media_url="https://cdn.example.com/creative.jpg",
         )
 
 
@@ -69,7 +91,7 @@ def test_phase1_blocks_reel_until_real_video_asset_pipeline_exists():
             creative_asset=creative,
             design_approval=_approval(),
             platform="instagram",
-            public_media_url="https://cdn.example.com/creative.png",
+            public_media_url="https://cdn.example.com/creative.jpg",
         )
 
 
