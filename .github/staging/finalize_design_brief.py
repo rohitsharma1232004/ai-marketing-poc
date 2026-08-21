@@ -7,9 +7,11 @@ def require(path, marker):
         raise RuntimeError(f"Required transformed marker missing in {path}: {marker!r}")
 
 
-def replace_once(path, old, new):
+def ensure_replacement(path, old, new):
     file_path = Path(path)
     text = file_path.read_text(encoding="utf-8")
+    if new in text:
+        return
     count = text.count(old)
     if count != 1:
         raise RuntimeError(f"Expected exactly one match in {path}, found {count}: {old[:90]!r}")
@@ -25,12 +27,12 @@ for path, marker in (
 ):
     require(path, marker)
 
-replace_once(
+ensure_replacement(
     "APPROVAL_WORKFLOW.md",
     '       -> Approve -> Excel download unlocked\n',
     '       -> Approve -> Excel download + Design Brief Generator unlocked\n',
 )
-replace_once(
+ensure_replacement(
     "APPROVAL_WORKFLOW.md",
     '- Excel export is allowed only when the latest version has a matching Senior `approved` decision. The exported content package displays `Senior Approved` status.\n',
     '- Excel export is allowed only when the latest version has a matching Senior `approved` decision. The exported content package displays `Senior Approved` status.\n'
@@ -38,12 +40,12 @@ replace_once(
     '- Design briefs are stored separately from approved content, so creative instructions cannot rewrite the approved package.\n'
     '- The dashboard derives `Design Status` as Locked, Not Generated, or Design Brief Ready without changing the approved content hash.\n',
 )
-replace_once(
+ensure_replacement(
     "DEVELOPMENT_ROADMAP.md",
     'Status: **Phase 1 complete; further content types planned**\n',
     'Status: **Phase 2 in validation — captions/reel scripts complete; Senior-approved Design Brief Generator implemented**\n',
 )
-replace_once(
+ensure_replacement(
     "DEVELOPMENT_ROADMAP.md",
     '''Next additions within this milestone:
 
@@ -65,7 +67,7 @@ Next additions within this milestone:
 - Automatic brand, claim, duplication and platform QA.
 ''',
 )
-replace_once(
+ensure_replacement(
     "DEVELOPMENT_ROADMAP.md",
     '- Generate complete design briefs from the approved content package.\n- Start with Canva handoff rather than automatic publishing.\n',
     '- Use the approved Design Briefs as the creative-production contract.\n- Start with Canva/manual designer handoff rather than automatic publishing.\n',
