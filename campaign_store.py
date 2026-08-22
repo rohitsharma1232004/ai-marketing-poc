@@ -29,7 +29,7 @@ from content_package import (
 from design_brief import normalize_design_brief
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
 CAMPAIGN_STATUSES = frozenset(
     {
         "generating",
@@ -962,6 +962,663 @@ class CampaignStore:
                 "Stored design briefs do not match the approved content hash."
             )
         return results
+
+
+    def save_creative_asset(
+        self,
+        campaign_id: str,
+        calendar_version_id: str,
+        content_hash: str,
+        post_number: int,
+        *,
+        file_name: str,
+        mime_type: str,
+        storage_path: str,
+        file_sha256: str,
+        file_size: int,
+        source_type: str = "manual_upload",
+        design_prompt: str = "",
+        source_provider: str = "",
+        source_model: str = "",
+        source_request_id: str = "",
+        source_metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append one immutable creative version for an approved post and design brief."""
+
+        clean_campaign_id = _canonical_uuid(campaign_id, "campaign_id")
+        clean_calendar_id = _canonical_uuid(calendar_version_id, "calendar_version_id")
+        clean_hash = _sha256_hash(content_hash, "content_hash")
+        if not isinstance(post_number, int) or isinstance(post_number, bool) or post_number < 1:
+            raise ValueError("post_number must be a positive integer.")
+        clean_name = _required_text(file_name, "file_name", max_length=300)
+        clean_mime = _required_text(mime_type, "mime_type", max_length=120).lower()
+        clean_storage = _required_text(storage_path, "storage_path", max_length=1200)
+        clean_file_hash = _sha256_hash(file_sha256, "file_sha256")
+        if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 1:
+            raise ValueError("file_size must be a positive integer.")
+        if file_size > 12 * 1024 * 1024:
+            raise ValueError("Creative file must be 12 MB or smaller.")
+        clean_source = _approval_choice(
+            source_type, "source_type", {"manual_upload", "ai_generated"}
+        )
+        clean_prompt = _bounded_optional_text(
+            design_prompt, "design_prompt", max_length=12_000
+        )
+        clean_provider = _bounded_optional_text(
+            source_provider, "source_provider", max_length=120
+        ).lower()
+        clean_model = _bounded_optional_text(
+            source_model, "source_model", max_length=300
+        )
+        clean_request_id = _bounded_optional_text(
+            source_request_id, "source_request_id", max_length=300
+        )
+        source_metadata_value = _require_mapping(source_metadata, "source_metadata")
+        if clean_source == "manual_upload" and not clean_provider:
+            clean_provider = "manual"
+        elif clean_source == "ai_generated" and not clean_provider:
+            clean_provider = "ai"
+        now = _utc_now()
+        asset_id = str(uuid4())
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (clean_campaign_id,)
+            ).fetchone()
+            if campaign is None:
+                raise RecordNotFound(f"Campaign {clean_campaign_id} was not found.")
+            if campaign["status"] not in {"fully_approved", "approved"}:
+                raise InvalidStatusTransition(
+                    "Creative assets can be added only after final Senior content approval."
+                )
+            calendar = connection.execute(
+                "SELECT * FROM calendar_versions WHERE id=? AND campaign_id=?",
+                (clean_calendar_id, clean_campaign_id),
+            ).fetchone()
+            if calendar is None:
+                raise RecordNotFound("That calendar version does not belong to this campaign.")
+            latest = connection.execute(
+                "SELECT id FROM calendar_versions WHERE campaign_id=? ORDER BY version DESC LIMIT 1",
+                (clean_campaign_id,),
+            ).fetchone()
+            if latest is None or latest["id"] != clean_calendar_id:
+                raise StoreConflict("Creative assets can be added only to the latest content version.")
+            calculated_hash = _calendar_content_hash(
+                _deserialize_json(calendar["headers_json"]),
+                _deserialize_json(calendar["rows_json"]),
+                _deserialize_json(calendar["client_metadata_json"]),
+                _deserialize_json(calendar["generation_metadata_json"]),
+            )
+            if calculated_hash != calendar["content_hash"] or calculated_hash != clean_hash:
+                raise StoreConflict("The creative upload does not match the approved content hash.")
+            senior_approval = connection.execute(
+                "SELECT 1 FROM approvals WHERE campaign_id=? AND calendar_version_id=? "
+                "AND role='senior' AND decision='approved' AND content_hash=?",
+                (clean_campaign_id, clean_calendar_id, calculated_hash),
+            ).fetchone()
+            if senior_approval is None:
+                raise InvalidStatusTransition(
+                    "A hash-matched Senior content approval is required before creative upload."
+                )
+            design_brief = connection.execute(
+                "SELECT * FROM design_briefs WHERE campaign_id=? AND calendar_version_id=? "
+                "AND post_number=? AND content_hash=?",
+                (clean_campaign_id, clean_calendar_id, post_number, calculated_hash),
+            ).fetchone()
+            if design_brief is None:
+                raise InvalidStatusTransition(
+                    "Generate the approved post's Design Brief before uploading a creative."
+                )
+            latest_existing = connection.execute(
+                "SELECT * FROM creative_assets WHERE campaign_id=? AND calendar_version_id=? "
+                "AND post_number=? ORDER BY asset_version DESC LIMIT 1",
+                (clean_campaign_id, clean_calendar_id, post_number),
+            ).fetchone()
+            if latest_existing is not None and latest_existing["file_sha256"] == clean_file_hash:
+                raise StoreConflict(
+                    "This exact creative file is already the latest version for this post."
+                )
+            # A replacement creative invalidates every still-pending link for the prior version.
+            connection.execute(
+                "UPDATE design_review_links SET status='revoked',revoked_at=? "
+                "WHERE campaign_id=? AND calendar_version_id=? AND post_number=? "
+                "AND status='pending'",
+                (now, clean_campaign_id, clean_calendar_id, post_number),
+            )
+            next_version = connection.execute(
+                "SELECT COALESCE(MAX(asset_version),0)+1 FROM creative_assets "
+                "WHERE campaign_id=? AND calendar_version_id=? AND post_number=?",
+                (clean_campaign_id, clean_calendar_id, post_number),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO creative_assets (
+                    id,campaign_id,calendar_version_id,content_hash,design_brief_id,
+                    post_number,row_index,format,asset_version,source_type,file_name,
+                    mime_type,storage_path,file_sha256,file_size,design_prompt,
+                    source_provider,source_model,source_request_id,source_metadata_json,created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    asset_id, clean_campaign_id, clean_calendar_id, calculated_hash,
+                    design_brief["id"], post_number, design_brief["row_index"],
+                    design_brief["format"], next_version, clean_source, clean_name,
+                    clean_mime, clean_storage, clean_file_hash, file_size, clean_prompt,
+                    clean_provider, clean_model, clean_request_id,
+                    _serialize_json(source_metadata_value, "source_metadata"), now,
+                ),
+            )
+            self._insert_event(
+                connection,
+                campaign_id=clean_campaign_id,
+                event_type="creative_asset_uploaded",
+                details={
+                    "creative_asset_id": asset_id,
+                    "calendar_version_id": clean_calendar_id,
+                    "post_number": post_number,
+                    "asset_version": next_version,
+                    "source_type": clean_source,
+                    "source_provider": clean_provider,
+                    "source_model": clean_model,
+                    "source_request_id": clean_request_id,
+                    "file_sha256": clean_file_hash,
+                },
+                from_status=campaign["status"],
+                to_status=campaign["status"],
+                timestamp=now,
+            )
+            row = connection.execute(
+                "SELECT * FROM creative_assets WHERE id=?", (asset_id,)
+            ).fetchone()
+            connection.commit()
+        return _creative_asset_from_row(row)
+
+    def get_creative_asset(self, creative_asset_id: str) -> dict[str, Any]:
+        clean_id = _canonical_uuid(creative_asset_id, "creative_asset_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM creative_assets WHERE id=?", (clean_id,)
+            ).fetchone()
+        if row is None:
+            raise RecordNotFound(f"Creative asset {clean_id} was not found.")
+        return _creative_asset_from_row(row)
+
+    def list_latest_creative_assets(
+        self, campaign_id: str, calendar_version_id: str
+    ) -> list[dict[str, Any]]:
+        """Return the newest creative for each post plus its latest review decision."""
+
+        clean_campaign_id = _canonical_uuid(campaign_id, "campaign_id")
+        clean_calendar_id = _canonical_uuid(calendar_version_id, "calendar_version_id")
+        with self._connection() as connection:
+            calendar = connection.execute(
+                "SELECT * FROM calendar_versions WHERE id=? AND campaign_id=?",
+                (clean_calendar_id, clean_campaign_id),
+            ).fetchone()
+            if calendar is None:
+                raise RecordNotFound("That calendar version does not belong to this campaign.")
+            calculated_hash = _calendar_content_hash(
+                _deserialize_json(calendar["headers_json"]),
+                _deserialize_json(calendar["rows_json"]),
+                _deserialize_json(calendar["client_metadata_json"]),
+                _deserialize_json(calendar["generation_metadata_json"]),
+            )
+            if calculated_hash != calendar["content_hash"]:
+                raise StoreConflict("The content version no longer matches its stored hash.")
+            rows = connection.execute(
+                "SELECT * FROM creative_assets WHERE campaign_id=? AND calendar_version_id=? "
+                "ORDER BY post_number ASC,asset_version DESC",
+                (clean_campaign_id, clean_calendar_id),
+            ).fetchall()
+            selected: dict[int, sqlite3.Row] = {}
+            for row in rows:
+                selected.setdefault(int(row["post_number"]), row)
+            results = []
+            for post_number in sorted(selected):
+                asset_row = selected[post_number]
+                if asset_row["content_hash"] != calculated_hash:
+                    raise StoreConflict("A creative asset does not match the approved content hash.")
+                approval = connection.execute(
+                    "SELECT * FROM design_approvals WHERE creative_asset_id=?",
+                    (asset_row["id"],),
+                ).fetchone()
+                active_link = connection.execute(
+                    "SELECT expires_at FROM design_review_links WHERE creative_asset_id=? "
+                    "AND status='pending' AND expires_at>? ORDER BY created_at DESC LIMIT 1",
+                    (asset_row["id"], _utc_now()),
+                ).fetchone()
+                item = _creative_asset_from_row(asset_row)
+                item["latest_decision"] = approval["decision"] if approval else None
+                item["design_feedback"] = approval["feedback"] if approval else ""
+                item["design_change_fields"] = (
+                    _deserialize_json(approval["change_fields_json"]) if approval else []
+                )
+                item["design_approver_name"] = approval["approver_name"] if approval else ""
+                item["design_approver_email"] = approval["approver_email"] if approval else ""
+                item["design_decided_at"] = approval["decided_at"] if approval else ""
+                item["active_review_link"] = active_link is not None
+                item["active_review_expires_at"] = active_link["expires_at"] if active_link else ""
+                results.append(item)
+        return results
+
+    def create_design_review_link(
+        self,
+        creative_asset_id: str,
+        token_hash: str,
+        expires_at: str,
+    ) -> dict[str, Any]:
+        """Create or replace a secure review link for the latest creative version."""
+
+        clean_asset_id = _canonical_uuid(creative_asset_id, "creative_asset_id")
+        clean_token_hash = _sha256_hash(token_hash, "token_hash")
+        clean_expires = _future_utc_timestamp(expires_at, "expires_at")
+        now = _utc_now()
+        link_id = str(uuid4())
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            asset = connection.execute(
+                "SELECT * FROM creative_assets WHERE id=?", (clean_asset_id,)
+            ).fetchone()
+            if asset is None:
+                raise RecordNotFound(f"Creative asset {clean_asset_id} was not found.")
+            campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (asset["campaign_id"],)
+            ).fetchone()
+            if campaign is None or campaign["status"] not in {"fully_approved", "approved"}:
+                raise InvalidStatusTransition(
+                    "Design review requires final Senior content approval."
+                )
+            latest_calendar = connection.execute(
+                "SELECT id FROM calendar_versions WHERE campaign_id=? ORDER BY version DESC LIMIT 1",
+                (asset["campaign_id"],),
+            ).fetchone()
+            if latest_calendar is None or latest_calendar["id"] != asset["calendar_version_id"]:
+                raise StoreConflict("Only the latest content version can enter design review.")
+            latest_asset = connection.execute(
+                "SELECT id FROM creative_assets WHERE campaign_id=? AND calendar_version_id=? "
+                "AND post_number=? ORDER BY asset_version DESC LIMIT 1",
+                (asset["campaign_id"], asset["calendar_version_id"], asset["post_number"]),
+            ).fetchone()
+            if latest_asset is None or latest_asset["id"] != clean_asset_id:
+                raise StoreConflict("Only the latest creative version can enter design review.")
+            decided = connection.execute(
+                "SELECT 1 FROM design_approvals WHERE creative_asset_id=?",
+                (clean_asset_id,),
+            ).fetchone()
+            if decided is not None:
+                raise StoreConflict("This creative version already has a Senior design decision.")
+            connection.execute(
+                "UPDATE design_review_links SET status='revoked',revoked_at=? "
+                "WHERE campaign_id=? AND calendar_version_id=? AND post_number=? "
+                "AND status='pending'",
+                (now, asset["campaign_id"], asset["calendar_version_id"], asset["post_number"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO design_review_links (
+                    id,creative_asset_id,campaign_id,calendar_version_id,post_number,
+                    asset_hash,token_hash,status,expires_at,opened_at,decided_at,
+                    revoked_at,created_at
+                ) VALUES (?,?,?,?,?,?,?,'pending',?,NULL,NULL,NULL,?)
+                """,
+                (
+                    link_id, clean_asset_id, asset["campaign_id"], asset["calendar_version_id"],
+                    asset["post_number"], asset["file_sha256"], clean_token_hash,
+                    clean_expires, now,
+                ),
+            )
+            self._insert_event(
+                connection,
+                campaign_id=asset["campaign_id"],
+                event_type="design_review_link_created",
+                details={
+                    "design_review_link_id": link_id,
+                    "creative_asset_id": clean_asset_id,
+                    "calendar_version_id": asset["calendar_version_id"],
+                    "post_number": asset["post_number"],
+                    "asset_version": asset["asset_version"],
+                    "expires_at": clean_expires,
+                },
+                from_status=campaign["status"],
+                to_status=campaign["status"],
+                timestamp=now,
+            )
+            row = connection.execute(
+                "SELECT * FROM design_review_links WHERE id=?", (link_id,)
+            ).fetchone()
+            connection.commit()
+        return _design_review_link_from_row(row)
+
+    def get_design_review_link_bundle(
+        self, token_hash: str, *, mark_opened: bool = False
+    ) -> dict[str, Any]:
+        """Resolve a still-active design-review capability to immutable review material."""
+
+        clean_hash = _sha256_hash(token_hash, "token_hash")
+        now = _utc_now()
+        with self._connection() as connection:
+            if mark_opened:
+                connection.execute("BEGIN IMMEDIATE")
+            link = connection.execute(
+                "SELECT * FROM design_review_links WHERE token_hash=?", (clean_hash,)
+            ).fetchone()
+            if link is None:
+                raise RecordNotFound("Design review link was not found.")
+            if link["status"] != "pending":
+                raise StoreConflict("This design review link is no longer active.")
+            if link["expires_at"] <= now:
+                raise StoreConflict("This design review link has expired.")
+            asset = connection.execute(
+                "SELECT * FROM creative_assets WHERE id=?", (link["creative_asset_id"],)
+            ).fetchone()
+            campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (link["campaign_id"],)
+            ).fetchone()
+            calendar = connection.execute(
+                "SELECT * FROM calendar_versions WHERE id=? AND campaign_id=?",
+                (link["calendar_version_id"], link["campaign_id"]),
+            ).fetchone()
+            if asset is None or campaign is None or calendar is None:
+                raise StoreConflict("This design review link is unavailable.")
+            if campaign["status"] not in {"fully_approved", "approved"}:
+                raise InvalidStatusTransition(
+                    "This campaign no longer has final Senior content approval."
+                )
+            latest_calendar = connection.execute(
+                "SELECT id FROM calendar_versions WHERE campaign_id=? ORDER BY version DESC LIMIT 1",
+                (link["campaign_id"],),
+            ).fetchone()
+            if latest_calendar is None or latest_calendar["id"] != link["calendar_version_id"]:
+                raise StoreConflict("This design review link is for an older content version.")
+            latest_asset = connection.execute(
+                "SELECT id FROM creative_assets WHERE campaign_id=? AND calendar_version_id=? "
+                "AND post_number=? ORDER BY asset_version DESC LIMIT 1",
+                (link["campaign_id"], link["calendar_version_id"], link["post_number"]),
+            ).fetchone()
+            if latest_asset is None or latest_asset["id"] != asset["id"]:
+                raise StoreConflict("A newer creative version has replaced this review link.")
+            calculated_hash = _calendar_content_hash(
+                _deserialize_json(calendar["headers_json"]),
+                _deserialize_json(calendar["rows_json"]),
+                _deserialize_json(calendar["client_metadata_json"]),
+                _deserialize_json(calendar["generation_metadata_json"]),
+            )
+            if (
+                calculated_hash != calendar["content_hash"]
+                or asset["content_hash"] != calculated_hash
+                or link["asset_hash"] != asset["file_sha256"]
+            ):
+                raise StoreConflict("This design review link does not match the approved source.")
+            if connection.execute(
+                "SELECT 1 FROM design_approvals WHERE creative_asset_id=?", (asset["id"],)
+            ).fetchone() is not None:
+                raise StoreConflict("This creative version already has a Senior design decision.")
+            design_brief = connection.execute(
+                "SELECT * FROM design_briefs WHERE id=?", (asset["design_brief_id"],)
+            ).fetchone()
+            client = connection.execute(
+                "SELECT * FROM clients WHERE id=?", (campaign["client_id"],)
+            ).fetchone()
+            if design_brief is None or client is None:
+                raise StoreConflict("Design review source material is unavailable.")
+            if mark_opened and link["opened_at"] is None:
+                connection.execute(
+                    "UPDATE design_review_links SET opened_at=? WHERE id=?", (now, link["id"])
+                )
+                link = connection.execute(
+                    "SELECT * FROM design_review_links WHERE id=?", (link["id"],)
+                ).fetchone()
+                connection.commit()
+        return {
+            "link": _design_review_link_from_row(link),
+            "asset": _creative_asset_from_row(asset),
+            "campaign": _campaign_from_row(campaign),
+            "calendar": _calendar_from_row(calendar),
+            "client": _client_from_row(client),
+            "design_brief": _design_brief_from_row(design_brief),
+        }
+
+    def decide_design_review_link(
+        self,
+        token_hash: str,
+        decision: str,
+        approver_name: str,
+        approver_email: str,
+        feedback: str = "",
+        *,
+        change_fields: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Consume a design-review link without mutating the approved content package."""
+
+        clean_hash = _sha256_hash(token_hash, "token_hash")
+        clean_decision = _approval_choice(decision, "decision", {"approved", "rejected"})
+        clean_name = _required_text(approver_name, "approver_name", max_length=200)
+        clean_email = _required_text(approver_email, "approver_email", max_length=320)
+        clean_feedback = _bounded_optional_text(feedback, "feedback", max_length=5000)
+        allowed_fields = (
+            "Layout", "Image / Visual", "Colors", "Typography", "Text Placement",
+            "Logo / Branding", "CTA Placement", "Carousel Slides", "Reel Scenes / B-roll",
+            "Thumbnail", "Other",
+        )
+        raw_fields = [] if change_fields is None else list(change_fields)
+        requested = {str(value).strip() for value in raw_fields if str(value).strip()}
+        unknown = requested.difference(allowed_fields)
+        if unknown:
+            raise ValueError("Unsupported design change field(s): " + ", ".join(sorted(unknown)))
+        clean_fields = [field for field in allowed_fields if field in requested]
+        if clean_decision == "rejected":
+            if not clean_feedback:
+                raise ValueError("feedback is required when a design is rejected.")
+            if not clean_fields:
+                raise ValueError("Select at least one design field that needs changes.")
+        elif clean_fields:
+            raise ValueError("change_fields are allowed only when requesting design changes.")
+        now = _utc_now()
+        approval_id = str(uuid4())
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            link = connection.execute(
+                "SELECT * FROM design_review_links WHERE token_hash=?", (clean_hash,)
+            ).fetchone()
+            if link is None:
+                raise RecordNotFound("Design review link was not found.")
+            if link["status"] != "pending" or link["expires_at"] <= now:
+                raise StoreConflict("This design review link is no longer active.")
+            asset = connection.execute(
+                "SELECT * FROM creative_assets WHERE id=?", (link["creative_asset_id"],)
+            ).fetchone()
+            campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id=?", (link["campaign_id"],)
+            ).fetchone()
+            calendar = connection.execute(
+                "SELECT * FROM calendar_versions WHERE id=? AND campaign_id=?",
+                (link["calendar_version_id"], link["campaign_id"]),
+            ).fetchone()
+            if asset is None or campaign is None or calendar is None:
+                raise StoreConflict("This design review link is unavailable.")
+            if campaign["status"] not in {"fully_approved", "approved"}:
+                raise InvalidStatusTransition("Final Senior content approval is required.")
+            latest_asset = connection.execute(
+                "SELECT id FROM creative_assets WHERE campaign_id=? AND calendar_version_id=? "
+                "AND post_number=? ORDER BY asset_version DESC LIMIT 1",
+                (link["campaign_id"], link["calendar_version_id"], link["post_number"]),
+            ).fetchone()
+            if latest_asset is None or latest_asset["id"] != asset["id"]:
+                raise StoreConflict("A newer creative version has replaced this review link.")
+            latest_calendar = connection.execute(
+                "SELECT id FROM calendar_versions WHERE campaign_id=? ORDER BY version DESC LIMIT 1",
+                (link["campaign_id"],),
+            ).fetchone()
+            if latest_calendar is None or latest_calendar["id"] != link["calendar_version_id"]:
+                raise StoreConflict("This design review link is for an older content version.")
+            calculated_hash = _calendar_content_hash(
+                _deserialize_json(calendar["headers_json"]),
+                _deserialize_json(calendar["rows_json"]),
+                _deserialize_json(calendar["client_metadata_json"]),
+                _deserialize_json(calendar["generation_metadata_json"]),
+            )
+            if calculated_hash != calendar["content_hash"] or asset["content_hash"] != calculated_hash:
+                raise StoreConflict("The creative no longer matches the approved content version.")
+            design_brief = connection.execute(
+                "SELECT content_hash FROM design_briefs WHERE id=?", (asset["design_brief_id"],)
+            ).fetchone()
+            if design_brief is None or design_brief["content_hash"] != calculated_hash:
+                raise StoreConflict("The creative no longer matches its approved Design Brief.")
+            if link["asset_hash"] != asset["file_sha256"]:
+                raise StoreConflict("The design review link does not match the creative file.")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO design_approvals (
+                        id,creative_asset_id,campaign_id,calendar_version_id,post_number,
+                        decision,approver_name,approver_email,feedback,change_fields_json,
+                        asset_hash,decided_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        approval_id, asset["id"], link["campaign_id"], link["calendar_version_id"],
+                        link["post_number"], clean_decision, clean_name, clean_email,
+                        clean_feedback, _serialize_json(clean_fields, "change_fields"),
+                        asset["file_sha256"], now,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StoreConflict("This creative version already has a Senior design decision.") from error
+            connection.execute(
+                "UPDATE design_review_links SET status='decided',decided_at=? WHERE id=?",
+                (now, link["id"]),
+            )
+            connection.execute(
+                "UPDATE design_review_links SET status='revoked',revoked_at=? "
+                "WHERE creative_asset_id=? AND id<>? AND status='pending'",
+                (now, asset["id"], link["id"]),
+            )
+            self._insert_event(
+                connection,
+                campaign_id=link["campaign_id"],
+                event_type="design_approval_recorded",
+                details={
+                    "design_approval_id": approval_id,
+                    "creative_asset_id": asset["id"],
+                    "calendar_version_id": link["calendar_version_id"],
+                    "post_number": link["post_number"],
+                    "asset_version": asset["asset_version"],
+                    "decision": clean_decision,
+                    "change_fields": clean_fields,
+                    "asset_hash": asset["file_sha256"],
+                },
+                from_status=campaign["status"],
+                to_status=campaign["status"],
+                timestamp=now,
+            )
+            approval = connection.execute(
+                "SELECT * FROM design_approvals WHERE id=?", (approval_id,)
+            ).fetchone()
+            updated_link = connection.execute(
+                "SELECT * FROM design_review_links WHERE id=?", (link["id"],)
+            ).fetchone()
+            connection.commit()
+        return {
+            "approval": _design_approval_from_row(approval),
+            "asset": _creative_asset_from_row(asset),
+            "link": _design_review_link_from_row(updated_link),
+        }
+
+
+    def save_brand_kit(self, client_id: str, brand_kit: Mapping[str, Any]) -> dict[str, Any]:
+        """Append one immutable Brand Kit version for a client.
+
+        Saving an unchanged normalized kit is idempotent and returns the current
+        latest version instead of creating duplicate history.
+        """
+        from brand_kit import normalize_brand_kit
+
+        clean_client_id = _canonical_uuid(client_id, "client_id")
+        normalized = normalize_brand_kit(brand_kit)
+        serialized = _serialize_json(normalized, "brand_kit")
+        now = _utc_now()
+        record_id = str(uuid4())
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            client = connection.execute(
+                "SELECT id FROM clients WHERE id=?", (clean_client_id,)
+            ).fetchone()
+            if client is None:
+                raise RecordNotFound(f"Client {clean_client_id} was not found.")
+            latest = connection.execute(
+                "SELECT * FROM client_brand_kits WHERE client_id=? "
+                "ORDER BY version DESC LIMIT 1",
+                (clean_client_id,),
+            ).fetchone()
+            if latest is not None and latest["kit_json"] == serialized:
+                connection.commit()
+                return {
+                    "id": latest["id"],
+                    "client_id": latest["client_id"],
+                    "version": latest["version"],
+                    "kit": _deserialize_json(latest["kit_json"]),
+                    "created_at": latest["created_at"],
+                }
+            next_version = 1 if latest is None else int(latest["version"]) + 1
+            connection.execute(
+                "INSERT INTO client_brand_kits (id,client_id,version,kit_json,created_at) "
+                "VALUES (?,?,?,?,?)",
+                (record_id, clean_client_id, next_version, serialized, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM client_brand_kits WHERE id=?", (record_id,)
+            ).fetchone()
+            connection.commit()
+        return {
+            "id": row["id"],
+            "client_id": row["client_id"],
+            "version": row["version"],
+            "kit": _deserialize_json(row["kit_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def get_latest_brand_kit(self, client_id: str) -> dict[str, Any] | None:
+        clean_client_id = _canonical_uuid(client_id, "client_id")
+        with self._connection() as connection:
+            client = connection.execute(
+                "SELECT id FROM clients WHERE id=?", (clean_client_id,)
+            ).fetchone()
+            if client is None:
+                raise RecordNotFound(f"Client {clean_client_id} was not found.")
+            row = connection.execute(
+                "SELECT * FROM client_brand_kits WHERE client_id=? "
+                "ORDER BY version DESC LIMIT 1",
+                (clean_client_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "client_id": row["client_id"],
+            "version": row["version"],
+            "kit": _deserialize_json(row["kit_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def list_brand_kits(self, client_id: str) -> list[dict[str, Any]]:
+        clean_client_id = _canonical_uuid(client_id, "client_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM client_brand_kits WHERE client_id=? "
+                "ORDER BY version DESC",
+                (clean_client_id,),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "client_id": row["client_id"],
+                "version": row["version"],
+                "kit": _deserialize_json(row["kit_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     # Manual client-share audit APIs appear before the automated review APIs.
     def upsert_review_recipient(
@@ -2444,6 +3101,9 @@ class CampaignStore:
             self._ensure_v5_senior_share_schema(connection)
             self._ensure_v6_senior_change_schema(connection)
             self._ensure_v7_design_brief_schema(connection)
+            self._ensure_v8_creative_review_schema(connection)
+            self._ensure_v9_brand_kit_schema(connection)
+            self._ensure_v10_creative_provenance_schema(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
 
@@ -3072,6 +3732,187 @@ class CampaignStore:
             "ON design_briefs(campaign_id,calendar_version_id,post_number)"
         )
 
+
+    @staticmethod
+    def _ensure_v8_creative_review_schema(connection: sqlite3.Connection) -> None:
+        """Install immutable creative versions and separate Senior design decisions."""
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS creative_assets (
+                id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL,
+                calendar_version_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL CHECK (
+                    length(content_hash)=64 AND content_hash NOT GLOB '*[^0-9a-f]*'
+                ),
+                design_brief_id TEXT NOT NULL,
+                post_number INTEGER NOT NULL CHECK (post_number > 0),
+                row_index INTEGER NOT NULL CHECK (row_index >= 0),
+                format TEXT NOT NULL,
+                asset_version INTEGER NOT NULL CHECK (asset_version > 0),
+                source_type TEXT NOT NULL CHECK (source_type IN ('manual_upload','ai_generated')),
+                file_name TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                file_sha256 TEXT NOT NULL CHECK (
+                    length(file_sha256)=64 AND file_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                file_size INTEGER NOT NULL CHECK (file_size > 0),
+                design_prompt TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE (campaign_id,calendar_version_id,post_number,asset_version),
+                FOREIGN KEY (campaign_id,calendar_version_id)
+                    REFERENCES calendar_versions(campaign_id,id) ON DELETE RESTRICT,
+                FOREIGN KEY (design_brief_id) REFERENCES design_briefs(id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS design_review_links (
+                id TEXT PRIMARY KEY,
+                creative_asset_id TEXT NOT NULL,
+                campaign_id TEXT NOT NULL,
+                calendar_version_id TEXT NOT NULL,
+                post_number INTEGER NOT NULL CHECK (post_number > 0),
+                asset_hash TEXT NOT NULL CHECK (
+                    length(asset_hash)=64 AND asset_hash NOT GLOB '*[^0-9a-f]*'
+                ),
+                token_hash TEXT NOT NULL UNIQUE CHECK (
+                    length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9a-f]*'
+                ),
+                status TEXT NOT NULL CHECK (status IN ('pending','decided','revoked')),
+                expires_at TEXT NOT NULL,
+                opened_at TEXT,
+                decided_at TEXT,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (creative_asset_id) REFERENCES creative_assets(id) ON DELETE RESTRICT,
+                FOREIGN KEY (campaign_id,calendar_version_id)
+                    REFERENCES calendar_versions(campaign_id,id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS design_approvals (
+                id TEXT PRIMARY KEY,
+                creative_asset_id TEXT NOT NULL UNIQUE,
+                campaign_id TEXT NOT NULL,
+                calendar_version_id TEXT NOT NULL,
+                post_number INTEGER NOT NULL CHECK (post_number > 0),
+                decision TEXT NOT NULL CHECK (decision IN ('approved','rejected')),
+                approver_name TEXT NOT NULL CHECK (length(approver_name) BETWEEN 1 AND 200),
+                approver_email TEXT NOT NULL CHECK (length(approver_email) BETWEEN 1 AND 320),
+                feedback TEXT NOT NULL DEFAULT '' CHECK (length(feedback) <= 5000),
+                change_fields_json TEXT NOT NULL,
+                asset_hash TEXT NOT NULL CHECK (
+                    length(asset_hash)=64 AND asset_hash NOT GLOB '*[^0-9a-f]*'
+                ),
+                decided_at TEXT NOT NULL,
+                FOREIGN KEY (creative_asset_id) REFERENCES creative_assets(id) ON DELETE RESTRICT,
+                FOREIGN KEY (campaign_id,calendar_version_id)
+                    REFERENCES calendar_versions(campaign_id,id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS creative_assets_post_idx "
+            "ON creative_assets(campaign_id,calendar_version_id,post_number,asset_version DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS design_review_links_post_idx "
+            "ON design_review_links(campaign_id,calendar_version_id,post_number,created_at)"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS design_review_links_one_active "
+            "ON design_review_links(campaign_id,calendar_version_id,post_number) "
+            "WHERE status='pending'"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS design_approvals_campaign_idx "
+            "ON design_approvals(campaign_id,calendar_version_id,post_number,decided_at)"
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS design_approvals_no_update
+            BEFORE UPDATE ON design_approvals
+            BEGIN
+                SELECT RAISE(ABORT, 'design approval decisions are immutable');
+            END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS design_approvals_no_delete
+            BEFORE DELETE ON design_approvals
+            BEGIN
+                SELECT RAISE(ABORT, 'design approval decisions are append-only');
+            END
+            """
+        )
+
+
+    @staticmethod
+    def _ensure_v9_brand_kit_schema(connection: sqlite3.Connection) -> None:
+        """Install immutable, versioned client Brand Kits."""
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS client_brand_kits (
+                id TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                version INTEGER NOT NULL CHECK (version > 0),
+                kit_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (client_id, version),
+                FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS client_brand_kits_latest_idx "
+            "ON client_brand_kits(client_id,version DESC)"
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS client_brand_kits_no_update
+            BEFORE UPDATE ON client_brand_kits
+            BEGIN
+                SELECT RAISE(ABORT, 'Brand Kit versions are immutable');
+            END
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS client_brand_kits_no_delete
+            BEFORE DELETE ON client_brand_kits
+            BEGIN
+                SELECT RAISE(ABORT, 'Brand Kit versions are append-only');
+            END
+            """
+        )
+
+
+    @staticmethod
+    def _ensure_v10_creative_provenance_schema(connection: sqlite3.Connection) -> None:
+        """Add provider/model/request metadata to immutable creative versions."""
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(creative_assets)").fetchall()
+        }
+        additions = (
+            ("source_provider", "TEXT NOT NULL DEFAULT ''"),
+            ("source_model", "TEXT NOT NULL DEFAULT ''"),
+            ("source_request_id", "TEXT NOT NULL DEFAULT ''"),
+            ("source_metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+        )
+        for column, definition in additions:
+            if column not in columns:
+                connection.execute(
+                    f"ALTER TABLE creative_assets ADD COLUMN {column} {definition}"
+                )
+
     @staticmethod
     def _ensure_v3_indexes_and_triggers(connection: sqlite3.Connection) -> None:
         statements = (
@@ -3567,6 +4408,67 @@ def _design_brief_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "brief": _deserialize_json(row["brief_json"]),
         "generation_metadata": _deserialize_json(row["generation_metadata_json"]),
         "created_at": row["created_at"],
+    }
+
+
+
+def _creative_asset_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "campaign_id": row["campaign_id"],
+        "calendar_version_id": row["calendar_version_id"],
+        "content_hash": row["content_hash"],
+        "design_brief_id": row["design_brief_id"],
+        "post_number": row["post_number"],
+        "row_index": row["row_index"],
+        "format": row["format"],
+        "asset_version": row["asset_version"],
+        "source_type": row["source_type"],
+        "file_name": row["file_name"],
+        "mime_type": row["mime_type"],
+        "storage_path": row["storage_path"],
+        "file_sha256": row["file_sha256"],
+        "file_size": row["file_size"],
+        "design_prompt": row["design_prompt"],
+        "source_provider": row["source_provider"],
+        "source_model": row["source_model"],
+        "source_request_id": row["source_request_id"],
+        "source_metadata": _deserialize_json(row["source_metadata_json"]),
+        "created_at": row["created_at"],
+    }
+
+
+def _design_review_link_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "creative_asset_id": row["creative_asset_id"],
+        "campaign_id": row["campaign_id"],
+        "calendar_version_id": row["calendar_version_id"],
+        "post_number": row["post_number"],
+        "asset_hash": row["asset_hash"],
+        "status": row["status"],
+        "expires_at": row["expires_at"],
+        "opened_at": row["opened_at"],
+        "decided_at": row["decided_at"],
+        "revoked_at": row["revoked_at"],
+        "created_at": row["created_at"],
+    }
+
+
+def _design_approval_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "creative_asset_id": row["creative_asset_id"],
+        "campaign_id": row["campaign_id"],
+        "calendar_version_id": row["calendar_version_id"],
+        "post_number": row["post_number"],
+        "decision": row["decision"],
+        "approver_name": row["approver_name"],
+        "approver_email": row["approver_email"],
+        "feedback": row["feedback"],
+        "change_fields": _deserialize_json(row["change_fields_json"]),
+        "asset_hash": row["asset_hash"],
+        "decided_at": row["decided_at"],
     }
 
 

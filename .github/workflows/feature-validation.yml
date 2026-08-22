@@ -1,0 +1,87 @@
+name: Feature validation
+
+on:
+  push:
+    branches:
+      - feature/senior-design-approval
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Apply Senior Design Approval feature
+        run: python staging/apply_senior_design_approval_v2.py
+
+      - name: Apply design approval hardening
+        run: python staging/apply_design_approval_final_improvements.py
+
+      - name: Apply design approval runtime fixes
+        run: python staging/apply_design_approval_runtime_hotfix.py
+
+      - name: Apply design review refresh UX
+        run: python staging/apply_design_review_refresh_hotfix.py
+
+      - name: Apply Brand Kit and Gemini Creative Studio
+        run: python staging/apply_brand_kit_gemini_creative_studio.py
+
+      - name: Remove n8n from active generation
+        run: python staging/apply_remove_n8n_direct_providers.py
+
+      - name: Apply Groq free-tier completion cap
+        run: python staging/apply_groq_free_tier_token_cap.py
+
+      - name: Apply Groq rate-limit diagnostics
+        run: python staging/apply_groq_rate_limit_diagnostics.py
+
+      - name: Apply complete Meta publishing feature
+        run: python staging/apply_meta_publishing_complete.py
+
+      - name: Compile
+        run: >-
+          python -m py_compile
+          app.py
+          campaign_store.py
+          brand_kit.py
+          brand_design_brief.py
+          content_package.py
+          creative_studio.py
+          creative_workflow.py
+          design_brief.py
+          generation_providers.py
+          generation_router.py
+          gemini_api.py
+          meta_publisher.py
+          publishing_media.py
+          publishing_runtime.py
+          publishing_store.py
+          publishing_worker.py
+          publishing_workflow.py
+          revision_logic.py
+          senior_review_links.py
+          supabase_media.py
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Diff sanity check
+        run: git diff --check

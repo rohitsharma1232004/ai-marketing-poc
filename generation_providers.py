@@ -145,7 +145,7 @@ def _generate_with_groq(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.3,
-        "max_completion_tokens": 8192,
+        "max_completion_tokens": 3500,
     }
     if model.startswith("openai/gpt-oss-"):
         payload.update({"reasoning_effort": "low", "include_reasoning": False})
@@ -192,8 +192,37 @@ def _generate_with_groq(
             code="GROQ_AUTH_ERROR",
         )
     if status_code == 429:
+        import re
+
+        safe_parts: list[str] = []
+        try:
+            rate_data = response.json()
+            if isinstance(rate_data, Mapping):
+                error_data = rate_data.get("error")
+                if isinstance(error_data, Mapping):
+                    raw_message = error_data.get("message")
+                    if isinstance(raw_message, str):
+                        dimension_match = re.search(r"\b(TPM|TPD|RPM|RPD)\b", raw_message)
+                        if dimension_match:
+                            safe_parts.append(dimension_match.group(1))
+                        for label in ("Limit", "Used", "Requested"):
+                            match = re.search(rf"{label}\s*[:=]?\s*([0-9,]+)", raw_message, re.IGNORECASE)
+                            if match:
+                                safe_parts.append(f"{label}: {match.group(1)}")
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+        response_headers = getattr(response, "headers", {}) or {}
+        retry_after = response_headers.get("retry-after") or response_headers.get("Retry-After")
+        token_reset = response_headers.get("x-ratelimit-reset-tokens")
+        if retry_after:
+            safe_parts.append(f"Retry after: {retry_after}")
+        elif token_reset:
+            safe_parts.append(f"Token reset: {token_reset}")
+
+        details = f" ({'; '.join(safe_parts)})" if safe_parts else ""
         raise GenerationProviderError(
-            "Groq rate limit reached. Please try again later.",
+            f"Groq rate limit reached{details}. Please try again later.",
             request_id=request_id,
             code="GROQ_RATE_LIMIT",
             retryable=True,

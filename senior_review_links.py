@@ -1,7 +1,7 @@
-"""Opaque capability helpers for manual Senior review links.
+"""Opaque capability helpers for Senior content and design review links.
 
-The raw token is shown only to the user who creates the link. The database stores
-only a domain-separated SHA-256 digest, so a database leak does not reveal active
+Raw tokens are shown only to the user who creates a link. The database stores
+only domain-separated SHA-256 digests, so a database leak does not reveal active
 review URLs.
 """
 
@@ -39,7 +39,16 @@ def hash_review_token(token: str) -> str:
     ).hexdigest()
 
 
-def build_review_url(public_base_url: str, token: str) -> str:
+def hash_design_review_token(token: str) -> str:
+    """Hash a design-review capability in a separate security domain."""
+
+    clean = normalize_review_token(token)
+    return hashlib.sha256(
+        b"senior-design-review-link\x00" + clean.encode("ascii")
+    ).hexdigest()
+
+
+def _build_capability_url(public_base_url: str, token: str, query_key: str) -> str:
     clean_token = normalize_review_token(token)
     if not isinstance(public_base_url, str):
         raise TypeError("public_base_url must be text.")
@@ -47,5 +56,13 @@ def build_review_url(public_base_url: str, token: str) -> str:
     parsed = urlsplit(base)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("APP_PUBLIC_BASE_URL must be a complete http(s) URL.")
-    query = urlencode({"review": clean_token})
+    query = urlencode({query_key: clean_token})
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", query, ""))
+
+
+def build_review_url(public_base_url: str, token: str) -> str:
+    return _build_capability_url(public_base_url, token, "review")
+
+
+def build_design_review_url(public_base_url: str, token: str) -> str:
+    return _build_capability_url(public_base_url, token, "design_review")
