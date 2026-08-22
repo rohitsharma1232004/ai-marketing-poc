@@ -3,3 +3,4 @@ requests>=2.31
 pypdf>=6.0,<7
 python-docx>=1.2,<2
 pytest>=8,<9
+supabase==2.31.0
