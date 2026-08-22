@@ -1,7 +1,7 @@
 """Provider-neutral creative-studio helpers.
 
-This layer keeps the app workflow independent of Gemini, Canva, Adobe, or a
-manual designer. Provider-specific network code lives elsewhere.
+This layer keeps the app workflow independent of Cloudflare, Gemini, Canva,
+Adobe, or a manual designer. Provider-specific network code lives elsewhere.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from creative_workflow import build_ai_design_prompt
 MAX_CREATIVE_GENERATION_PROMPT_CHARS = 12_000
 
 CREATIVE_METHODS = (
+    "cloudflare",
     "gemini",
     "canva",
     "adobe",
@@ -22,6 +23,12 @@ CREATIVE_METHODS = (
 )
 
 PROVIDER_CAPABILITIES = {
+    "cloudflare": {
+        "label": "Cloudflare Workers AI",
+        "available_in_app": True,
+        "purpose": "Free-first prompt-to-image generation with Cloudflare-hosted FLUX.1 Schnell.",
+        "credential": "CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN",
+    },
     "gemini": {
         "label": "Gemini AI",
         "available_in_app": True,
