@@ -7,7 +7,7 @@ transforms have been applied:
 
 This keeps Groq as the content-generation provider. It only adds the publishing
 path after final Senior Design Approval, then applies the final Brand Kit and
-Gemini diagnostic UX polish.
+Gemini diagnostic UX polish plus the current Gemini JPEG response requirement.
 """
 
 from __future__ import annotations
@@ -34,8 +34,9 @@ def main() -> None:
     run_script("apply_publishing_final_hardening.py")
     run_script("apply_professional_ux_and_gemini_diagnostics.py")
     run_script("apply_professional_ux_compile_hotfix.py")
+    run_script("apply_gemini_jpeg_response_format.py")
     print(
-        "Complete Meta image publishing + professional UX applied. "
+        "Complete Meta image publishing + professional UX + Gemini JPEG fix applied. "
         "Groq content flow unchanged."
     )
 
