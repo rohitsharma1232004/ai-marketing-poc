@@ -35,11 +35,54 @@ from design_brief import (
     display_design_brief_sections,
     parse_design_brief_response,
 )
-from generation_providers import (
-    DEFAULT_GROQ_API_URL,
-    GenerationProviderError,
-    generate_calendar_content,
+from creative_workflow import (
+    DESIGN_CHANGE_FIELDS,
+    PUBLISHING_STATUS_READY,
+    build_ai_design_prompt,
+    build_design_review_dashboard_rows,
+    content_post_by_number,
+    creative_status,
+    publishing_status,
+    validate_creative_upload,
 )
+from generation_providers import DEFAULT_GROQ_API_URL, GenerationProviderError
+from generation_router import generate_calendar_content
+from gemini_api import DEFAULT_GEMINI_INTERACTIONS_URL, DEFAULT_GEMINI_TEXT_MODEL
+from brand_design_brief import build_brand_aware_design_brief_prompt
+from brand_kit import normalize_brand_kit, validate_logo_upload
+from creative_studio import (
+    build_branded_design_prompt,
+    build_design_revision_prompt,
+    generated_image_extension,
+    recommended_aspect_ratio,
+)
+from cloudflare_images import (
+    DEFAULT_CLOUDFLARE_IMAGE_MODEL,
+    CloudflareImageError,
+    generate_image as generate_cloudflare_image,
+)
+from gemini_api import (
+    DEFAULT_GEMINI_IMAGE_MODEL,
+    SUPPORTED_GEMINI_IMAGE_MODELS,
+    SUPPORTED_IMAGE_ASPECT_RATIOS,
+    GeminiAPIError,
+    generate_image,
+)
+from publishing_store import (
+    PublishingConflict,
+    PublishingNotFound,
+    PublishingStore,
+    PublishingStoreError,
+)
+from publishing_workflow import normalize_scheduled_for
+from meta_publisher import DEFAULT_META_GRAPH_API_VERSION
+from publishing_media import prepare_image_for_approved_platforms
+from publishing_runtime import (
+    configured_auto_worker_enabled,
+    start_background_publishing_worker,
+)
+from publishing_worker import run_due_jobs
+from supabase_media import SupabaseMediaError, upload_public_creative
 from revision_logic import (
     REVISION_FIELDS,
     build_field_revision_prompt,
@@ -47,8 +90,10 @@ from revision_logic import (
     merge_revised_fields,
 )
 from senior_review_links import (
+    build_design_review_url,
     build_review_url,
     generate_review_token,
+    hash_design_review_token,
     hash_review_token,
 )
 
@@ -135,6 +180,8 @@ CLIENT_DETAIL_LABELS = {
 }
 DEFAULT_CAMPAIGN_DB_PATH = Path(__file__).with_name("data") / "marketing_poc.sqlite3"
 DEFAULT_GENERATED_OUTPUT_DIR = Path(__file__).with_name("generated_outputs")
+DEFAULT_CREATIVE_OUTPUT_DIR = DEFAULT_GENERATED_OUTPUT_DIR / "creative_assets"
+DEFAULT_BRAND_ASSET_DIR = DEFAULT_GENERATED_OUTPUT_DIR / "brand_assets"
 PERSISTENCE_EXCEPTIONS = (
     CampaignStoreError,
     sqlite3.Error,
@@ -308,20 +355,150 @@ the user message, without week headings or commentary.
 """.strip()
 
 st.set_page_config(page_title="AI Marketing POC", page_icon="🤖", layout="wide")
+st.markdown(
+    """
+    <style>
+    :root {
+      --primary: #4f46e5;
+      --primary-dark: #312e81;
+      --secondary: #0f766e;
+      --background: #f5f7ff;
+      --surface: rgba(255, 255, 255, 0.78);
+      --surface-strong: #ffffff;
+      --text: #0f172a;
+      --muted: #475569;
+      --border: rgba(148, 163, 184, 0.28);
+      --shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+    }
+
+    [data-testid="stAppViewContainer"] {
+      background: linear-gradient(180deg, #f5f1ff 0%, #eef8ff 100%);
+    }
+
+    section[data-testid="stSidebar"] {
+      background: rgba(255, 255, 255, 0.72);
+      border-right: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+    }
+
+    .block-container {
+      padding-top: 2rem;
+      padding-bottom: 2.5rem;
+      max-width: 1500px;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"],
+    div[data-testid="stChatMessage"],
+    div[data-testid="stMetric"],
+    div[data-testid="stExpander"],
+    div[data-testid="stForm"],
+    div[data-testid="stAlert"],
+    div[data-testid="stFileUploader"] {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      background: rgba(255, 255, 255, 0.8);
+    }
+
+    .stButton > button,
+    .stDownloadButton > button,
+    [data-testid="baseButton-primary"] {
+      background: linear-gradient(135deg, var(--primary) 0%, #6d5efc 100%);
+      border: none;
+      border-radius: 12px;
+      color: white;
+      font-weight: 600;
+      padding: 0.7rem 1.2rem;
+      box-shadow: 0 10px 18px rgba(79, 70, 229, 0.22);
+    }
+
+    .stButton > button:hover,
+    .stDownloadButton > button:hover,
+    [data-testid="baseButton-primary"]:hover {
+      filter: brightness(1.04);
+      transform: translateY(-1px);
+    }
+
+    .stSecondaryButton > button,
+    button[kind="secondary"] {
+      background: rgba(255, 255, 255, 0.8);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 12px;
+    }
+
+    .stTabs [role="tablist"] {
+      gap: 0.5rem;
+    }
+
+    .stTabs [role="tab"] {
+      border-radius: 10px;
+      padding: 0.55rem 1rem;
+      font-weight: 600;
+      color: var(--muted);
+    }
+
+    .stTabs [role="tab"][aria-selected="true"] {
+      background: rgba(79, 70, 229, 0.09);
+      color: var(--primary-dark);
+      border: 1px solid rgba(79, 70, 229, 0.22);
+    }
+
+    .stWarning,
+    .stSuccess,
+    .stInfo,
+    .stError {
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+    }
+
+    div[data-testid="stToolbar"] {
+      display: none;
+    }
+
+    h1, h2, h3 {
+      letter-spacing: -0.04em;
+      color: var(--text);
+    }
+
+    .stSidebar .stMarkdownContainer p,
+    .stSidebar .stMarkdownContainer li,
+    .stSidebar [data-testid="stSidebarNav"] {
+      color: var(--text);
+    }
+
+    .stMarkdownContainer code {
+      background: rgba(148, 163, 184, 0.08);
+      border-radius: 8px;
+      padding: 0.12rem 0.35rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 try:
     REVIEW_MODE_TOKEN = str(st.query_params.get("review", "") or "").strip()
 except Exception:
     REVIEW_MODE_TOKEN = ""
+try:
+    DESIGN_REVIEW_MODE_TOKEN = str(st.query_params.get("design_review", "") or "").strip()
+except Exception:
+    DESIGN_REVIEW_MODE_TOKEN = ""
 
 configured_provider = get_app_setting(
     "CALENDAR_GENERATION_PROVIDER", DEFAULT_CALENDAR_GENERATION_PROVIDER
 ).strip().lower()
-provider_label = "n8n Automation" if configured_provider == "n8n" else "Groq Cloud AI"
+provider_label = {
+    "groq": "Groq Cloud AI",
+    "gemini": "Gemini AI",
+    "n8n": "n8n Automation",
+}.get(configured_provider, "Configured AI")
 
-if not REVIEW_MODE_TOKEN:
+if not REVIEW_MODE_TOKEN and not DESIGN_REVIEW_MODE_TOKEN:
     st.title("AI Marketing Content POC")
     st.caption(
-        f"Client details → {provider_label} → Content Package → Senior Approval → Design Briefs / Excel"
+        f"Client details → {provider_label} → Content Package → Senior Approval → Design Briefs → Creative Review / Excel"
     )
     st.info(
         "Single-approval POC: the generated content package must be approved by a Senior "
@@ -339,6 +516,35 @@ except PERSISTENCE_EXCEPTIONS:
         "and campaign history cannot be lost. Restart the app or check the "
         "CAMPAIGN_DB_PATH setting."
     )
+
+publishing_store = None
+if campaign_store is not None:
+    try:
+        publishing_store = PublishingStore(
+            get_app_setting("CAMPAIGN_DB_PATH", str(DEFAULT_CAMPAIGN_DB_PATH))
+        )
+    except (PublishingStoreError, sqlite3.Error, OSError, ValueError) as error:
+        st.warning(
+            "Publishing queue is unavailable, but content/design work can continue. "
+            f"Details: {error}"
+        )
+
+if publishing_store is not None:
+    try:
+        auto_worker_enabled = configured_auto_worker_enabled(
+            get_app_setting("AUTO_PUBLISH_WORKER", "false")
+        )
+        if auto_worker_enabled:
+            start_background_publishing_worker(
+                get_app_setting("CAMPAIGN_DB_PATH", str(DEFAULT_CAMPAIGN_DB_PATH)),
+                interval_seconds=get_app_setting("PUBLISHING_WORKER_INTERVAL_SECONDS", "60"),
+                api_version=get_app_setting(
+                    "META_GRAPH_API_VERSION", DEFAULT_META_GRAPH_API_VERSION
+                ),
+            )
+    except (TypeError, ValueError, RuntimeError) as error:
+        st.warning(f"Automatic publishing worker is disabled: {error}")
+
 
 def normalized_heading(value):
     return re.sub(r"[^a-z0-9]+", "", str(value).lower())
@@ -489,7 +695,7 @@ def build_canonical_calendar(model_rows, schedule):
     """Map validated model ideas to the application-controlled schedule."""
     if len(model_rows) != len(schedule):
         raise ValueError(
-            f"Groq returned {len(model_rows)} content rows, but "
+            f"AI provider returned {len(model_rows)} content rows, but "
             f"{len(schedule)} were requested."
         )
 
@@ -1127,6 +1333,1407 @@ def render_senior_review_portal(store, raw_token):
     st.info("This review link is now consumed and cannot be used for another decision.")
 
 
+
+def verify_creative_file_integrity(asset):
+    """Return (ok, path, bytes, error) for a creative stored by this app."""
+    output_root = Path(
+        get_app_setting("CREATIVE_OUTPUT_DIR", str(DEFAULT_CREATIVE_OUTPUT_DIR))
+    ).expanduser().resolve()
+    try:
+        path = Path(asset["storage_path"]).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False, None, None, "The creative file is missing from this app instance."
+    if path != output_root and output_root not in path.parents:
+        return False, None, None, "The creative file path is outside the configured creative storage directory."
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return False, None, None, "The creative file could not be read."
+    actual_hash = hashlib.sha256(raw).hexdigest()
+    if actual_hash != str(asset.get("file_sha256") or ""):
+        return False, None, None, "The creative file changed after upload and failed its SHA-256 integrity check."
+    if len(raw) != int(asset.get("file_size") or 0):
+        return False, None, None, "The creative file size changed after upload."
+    return True, path, raw, ""
+
+
+def render_creative_file(asset, *, key_prefix):
+    ok, path, raw, error = verify_creative_file_integrity(asset)
+    if not ok:
+        st.error(error)
+        return False
+    if str(asset["mime_type"]).startswith("image/"):
+        st.image(raw, caption=f"{asset['file_name']} — v{asset['asset_version']}")
+    elif asset["mime_type"] == "application/pdf":
+        st.download_button(
+            "Open / Download Creative PDF",
+            data=raw,
+            file_name=asset["file_name"],
+            mime="application/pdf",
+            key=f"{key_prefix}_pdf_download",
+            use_container_width=True,
+        )
+    else:
+        st.error("The saved creative has an unsupported MIME type.")
+        return False
+    return True
+
+
+def render_design_review_portal(store, raw_token):
+    """Render a secure, creative-only Senior review page."""
+    st.title("Senior Design Review")
+    st.caption(
+        "Secure design review — approved content is read-only; only the creative can be approved or sent back."
+    )
+    if store is None:
+        st.error("Review storage is unavailable. Ask the campaign owner to try again.")
+        return
+    try:
+        token_hash = hash_design_review_token(raw_token)
+        bundle = store.get_design_review_link_bundle(token_hash, mark_opened=True)
+    except PERSISTENCE_EXCEPTIONS:
+        st.error(
+            "This design review link is invalid, expired, replaced, or already used. "
+            "Ask the campaign owner to create a new design review link."
+        )
+        return
+
+    campaign = bundle["campaign"]
+    calendar = bundle["calendar"]
+    client = bundle["client"]
+    asset = bundle["asset"]
+    design_brief = bundle["design_brief"]
+    link = bundle["link"]
+    try:
+        approved_post = content_post_by_number(
+            calendar["headers"],
+            calendar["rows"],
+            int(asset["post_number"]),
+            week_heading_prefix=WEEK_HEADING_PREFIX,
+        )
+    except (TypeError, ValueError) as error:
+        st.error(f"The approved source post cannot be displayed safely: {error}")
+        return
+
+    st.success("Status: Pending Senior Design Review")
+    st.markdown(f"**Client:** {client['name']}")
+    st.markdown(
+        f"**Post {asset['post_number']} — {asset['format']} — Creative v{asset['asset_version']}**"
+    )
+    st.caption(f"Campaign ID: {campaign['id']}")
+    st.caption(f"Review link expires: {link['expires_at']}")
+
+    st.markdown("### Approved Content (Read-only)")
+    for field in ("Content Idea", "CTA", "Caption", "Reel Script"):
+        value = approved_post["content"].get(field)
+        if value and str(value).strip() and str(value).strip().lower() != "not applicable":
+            st.markdown(f"**{field}:** {value}")
+
+    st.markdown("### Approved Design Brief")
+    for label, value in display_design_brief_sections(design_brief["brief"]):
+        st.markdown(f"**{label}**")
+        if isinstance(value, list):
+            for index, item in enumerate(value, start=1):
+                st.write(f"{index}. {item}")
+        else:
+            st.write(value)
+
+    st.markdown("### Creative to Review")
+    creative_file_ok = render_creative_file(
+        asset, key_prefix=f"design_review_{asset['id']}"
+    )
+    if not creative_file_ok:
+        st.error(
+            "Design decision controls are locked because the exact uploaded creative "
+            "cannot be verified. Ask the campaign owner to upload a fresh creative version."
+        )
+        return
+
+    decision_choice = st.radio(
+        "Senior Design Decision",
+        ("Approve Design", "Request Design Changes"),
+        horizontal=True,
+        key=f"design_decision_{link['id']}",
+    )
+    selected_fields = []
+    feedback = ""
+    if decision_choice == "Request Design Changes":
+        selected_fields = st.multiselect(
+            "Which design area(s) need changes?",
+            list(DESIGN_CHANGE_FIELDS),
+            key=f"design_change_fields_{link['id']}",
+        )
+        feedback = st.text_area(
+            "Required Design Changes",
+            max_chars=5000,
+            key=f"design_feedback_{link['id']}",
+            placeholder="Example: Keep the approved headline and CTA unchanged. Increase logo visibility and simplify the background.",
+        )
+
+    with st.form(f"design_review_form_{link['id']}"):
+        reviewer_name = st.text_input("Senior Reviewer Name", max_chars=200)
+        reviewer_email = st.text_input("Senior Reviewer Email", max_chars=320)
+        submit = st.form_submit_button(
+            "Approve Design" if decision_choice == "Approve Design" else "Submit Design Changes",
+            use_container_width=True,
+        )
+    if not submit:
+        return
+    if not reviewer_name.strip() or not reviewer_email.strip():
+        st.error("Senior reviewer name and email are required.")
+        return
+    decision = "approved" if decision_choice == "Approve Design" else "rejected"
+    if decision == "rejected" and (not selected_fields or not feedback.strip()):
+        st.error("Select at least one design area and describe the required changes.")
+        return
+    try:
+        result = store.decide_design_review_link(
+            token_hash,
+            decision,
+            reviewer_name.strip(),
+            reviewer_email.strip(),
+            feedback.strip() if decision == "rejected" else "",
+            change_fields=selected_fields if decision == "rejected" else [],
+        )
+    except PERSISTENCE_EXCEPTIONS as error:
+        st.error(f"The design decision could not be saved: {error}")
+        return
+    if result["approval"]["decision"] == "approved":
+        st.success("Design approved. This creative version is now final for the post.")
+    else:
+        st.success(
+            "Design change request saved. The marketing/design team can upload a new creative version."
+        )
+    st.info(
+        "This design review link is now consumed and cannot be reused. "
+        "The campaign owner should click Refresh Senior Design Status on the main dashboard to see this decision."
+    )
+
+
+
+
+def _brand_kit_logo_is_intact(kit):
+    path_value = str((kit or {}).get("logo_storage_path") or "").strip()
+    if not path_value:
+        return False, None, None
+    try:
+        path = Path(path_value).expanduser().resolve(strict=True)
+        raw = path.read_bytes()
+    except (OSError, RuntimeError):
+        return False, None, None
+    if hashlib.sha256(raw).hexdigest() != str(kit.get("logo_sha256") or ""):
+        return False, path, None
+    if len(raw) != int(kit.get("logo_file_size") or 0):
+        return False, path, None
+    return True, path, raw
+
+
+def render_brand_kit_editor(store, client):
+    """Create or version a client Brand Kit used by every creative provider."""
+    try:
+        current_record = store.get_latest_brand_kit(client["id"])
+    except PERSISTENCE_EXCEPTIONS as error:
+        st.warning(f"Brand Kit could not be loaded: {error}")
+        current_record = None
+    current = dict((current_record or {}).get("kit") or {})
+    defaults = normalize_brand_kit(current)
+
+    # Professional Brand Kit UX: compact status first; editor opens only on demand.
+    st.markdown("#### Brand Kit")
+    editor_key = f"brand_kit_editor_open_{client['id']}"
+    editor_open = bool(st.session_state.get(editor_key, False))
+    if current_record:
+        status_cols = st.columns(3)
+        status_cols[0].metric("Status", "Configured")
+        status_cols[1].metric("Version", f"v{current_record['version']}")
+        status_cols[2].metric(
+            "Logo", "Added" if defaults.get("logo_storage_path") else "Not added"
+        )
+        summary_bits = []
+        if defaults.get("primary_color"):
+            summary_bits.append(f"Primary {defaults['primary_color']}")
+        if defaults.get("visual_style"):
+            summary_bits.append(defaults["visual_style"][:120])
+        st.caption(
+            "Saved once per client and reused across future campaigns."
+            + ("  •  " + "  •  ".join(summary_bits) if summary_bits else "")
+        )
+        toggle_label = "Close Brand Kit Editor" if editor_open else "View / Edit Brand Kit"
+    else:
+        st.info(
+            "Brand Kit is not configured yet. Creative generation can continue, but adding "
+            "the client's logo, colors and visual direction improves brand consistency."
+        )
+        toggle_label = "Close Brand Kit Setup" if editor_open else "Set Up Brand Kit"
+
+    if st.button(
+        toggle_label,
+        key=f"brand_kit_toggle_{client['id']}",
+        use_container_width=False,
+    ):
+        st.session_state[editor_key] = not editor_open
+        st.rerun()
+
+    if st.session_state.get(editor_key, False):
+        st.caption(
+            "Brand identity is separate from approved marketing content. Saving a Brand Kit "
+            "changes visual guidance only."
+        )
+        logo_ok, _logo_path, logo_raw = _brand_kit_logo_is_intact(defaults)
+        if defaults.get("logo_storage_path"):
+            if logo_ok:
+                st.image(logo_raw, caption=f"Current logo: {defaults['logo_file_name']}", width=180)
+            else:
+                st.warning(
+                    "The saved Brand Kit logo is missing or changed. Upload the logo again before relying on it."
+                )
+
+        with st.form(f"brand_kit_form_{client['id']}"):
+            brand_name = st.text_input(
+                "Brand Name",
+                value=defaults.get("brand_name") or client.get("name") or "",
+                max_chars=200,
+            )
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                primary_color = st.text_input(
+                    "Primary Color (hex)", value=defaults.get("primary_color") or ""
+                )
+            with col2:
+                secondary_color = st.text_input(
+                    "Secondary Color (hex)", value=defaults.get("secondary_color") or ""
+                )
+            with col3:
+                accent_color = st.text_input(
+                    "Accent Color (hex)", value=defaults.get("accent_color") or ""
+                )
+            font1, font2 = st.columns(2)
+            with font1:
+                heading_font = st.text_input(
+                    "Heading Font Preference", value=defaults.get("heading_font") or ""
+                )
+            with font2:
+                body_font = st.text_input(
+                    "Body Font Preference", value=defaults.get("body_font") or ""
+                )
+            brand_voice = st.text_area(
+                "Brand Voice", value=defaults.get("brand_voice") or "", max_chars=1200
+            )
+            visual_style = st.text_area(
+                "Visual Style", value=defaults.get("visual_style") or "", max_chars=1200
+            )
+            preferred_imagery = st.text_area(
+                "Preferred Imagery", value=defaults.get("preferred_imagery") or "", max_chars=1200
+            )
+            web1, web2 = st.columns(2)
+            with web1:
+                website = st.text_input(
+                    "Website (optional)", value=defaults.get("website") or "", max_chars=500
+                )
+            with web2:
+                instagram_handle = st.text_input(
+                    "Instagram Handle (optional)",
+                    value=defaults.get("instagram_handle") or "",
+                    max_chars=200,
+                )
+            do_rules = st.text_area(
+                "Brand DO Rules (one per line)",
+                value="\n".join(defaults.get("do_rules") or []),
+                max_chars=5000,
+            )
+            dont_rules = st.text_area(
+                "Brand DON'T Rules (one per line)",
+                value="\n".join(defaults.get("dont_rules") or []),
+                max_chars=5000,
+            )
+            notes = st.text_area(
+                "Additional Brand Notes", value=defaults.get("notes") or "", max_chars=4000
+            )
+            logo_upload = st.file_uploader(
+                "Logo (optional — PNG/JPG, max 5 MB)",
+                type=["png", "jpg", "jpeg"],
+                key=f"brand_logo_{client['id']}_{(current_record or {}).get('version', 0)}",
+            )
+            save_brand = st.form_submit_button("Save Brand Kit", use_container_width=True)
+
+        if save_brand:
+            new_logo_path = None
+            try:
+                logo_metadata = {
+                    key: defaults.get(key)
+                    for key in (
+                        "logo_file_name",
+                        "logo_mime_type",
+                        "logo_storage_path",
+                        "logo_sha256",
+                        "logo_file_size",
+                    )
+                }
+                if logo_upload is not None:
+                    logo_raw_new = logo_upload.getvalue()
+                    validated_logo = validate_logo_upload(
+                        logo_upload.name, logo_upload.type, logo_raw_new
+                    )
+                    logo_root = Path(
+                        get_app_setting("BRAND_ASSET_DIR", str(DEFAULT_BRAND_ASSET_DIR))
+                    )
+                    client_dir = logo_root / client["id"]
+                    client_dir.mkdir(parents=True, exist_ok=True)
+                    new_logo_path = client_dir / (
+                        f"{uuid4().hex}{validated_logo['extension']}"
+                    )
+                    new_logo_path.write_bytes(logo_raw_new)
+                    logo_metadata = {
+                        "logo_file_name": validated_logo["logo_file_name"],
+                        "logo_mime_type": validated_logo["logo_mime_type"],
+                        "logo_storage_path": str(new_logo_path),
+                        "logo_sha256": validated_logo["logo_sha256"],
+                        "logo_file_size": validated_logo["logo_file_size"],
+                    }
+                kit = normalize_brand_kit(
+                    {
+                        "brand_name": brand_name,
+                        "primary_color": primary_color,
+                        "secondary_color": secondary_color,
+                        "accent_color": accent_color,
+                        "heading_font": heading_font,
+                        "body_font": body_font,
+                        "brand_voice": brand_voice,
+                        "visual_style": visual_style,
+                        "preferred_imagery": preferred_imagery,
+                        "website": website,
+                        "instagram_handle": instagram_handle,
+                        "do_rules": do_rules,
+                        "dont_rules": dont_rules,
+                        "notes": notes,
+                        **logo_metadata,
+                    }
+                )
+                store.save_brand_kit(client["id"], kit)
+            except PERSISTENCE_EXCEPTIONS as error:
+                if new_logo_path is not None:
+                    new_logo_path.unlink(missing_ok=True)
+                st.error(f"Brand Kit could not be saved: {error}")
+            else:
+                st.session_state[editor_key] = False
+                st.success("Brand Kit saved. New creative prompts will use this version.")
+                st.rerun()
+    return current
+
+
+
+def render_meta_publishing_panel(
+    store,
+    campaign,
+    calendar,
+    client,
+    design_briefs,
+    latest_assets,
+):
+    """Configure client Meta destination and queue only fully approved image posts."""
+
+    st.markdown("### Publishing")
+    try:
+        gate = publishing_status(latest_assets, len(design_briefs))
+    except (TypeError, ValueError) as error:
+        st.warning(f"Publishing status is unavailable: {error}")
+        return
+    if gate != PUBLISHING_STATUS_READY:
+        st.info("Publishing Gate: Locked until every latest creative is Senior Design Approved.")
+        return
+
+    st.success("Publishing Gate: Ready — content and latest creatives are Senior approved.")
+    st.caption(
+        "Phase 1 publishes single-image PNG/JPEG posts only. Reel/Video and Carousel "
+        "remain blocked until real platform-ready video/slide assets are stored."
+    )
+
+    try:
+        active_connection = store.get_active_meta_connection(client["id"])
+    except (PublishingStoreError, sqlite3.Error, ValueError) as error:
+        st.warning(f"Meta connection status could not be loaded: {error}")
+        active_connection = None
+
+    with st.expander("Client Meta Connection", expanded=not bool(active_connection)):
+        if active_connection:
+            st.success(f"Active connection: {active_connection['connection_name']}")
+            if active_connection.get("facebook_page_id"):
+                st.caption(f"Facebook Page ID: {active_connection['facebook_page_id']}")
+            if active_connection.get("instagram_user_id"):
+                st.caption(
+                    f"Instagram Professional ID: {active_connection['instagram_user_id']}"
+                )
+            credential_ref = str(active_connection.get("credential_ref") or "")
+            secret_present = bool(get_app_setting(credential_ref)) if credential_ref else False
+            st.caption(
+                f"Credential reference: {credential_ref} — runtime secret "
+                + ("found" if secret_present else "not configured yet")
+            )
+
+        with st.form(f"meta_connection_{client['id']}"):
+            connection_name = st.text_input(
+                "Connection Name",
+                value=(active_connection or {}).get("connection_name") or f"{client['name']} Meta",
+                max_chars=200,
+            )
+            st.caption(
+                "Use a Facebook Page Access Token for Facebook publishing. For Instagram, use the Instagram Professional ID and a matching Instagram token in the same secret."
+            )
+            meta_col1, meta_col2 = st.columns(2)
+            with meta_col1:
+                facebook_page_id = st.text_input(
+                    "Facebook Page ID (optional)",
+                    value=(active_connection or {}).get("facebook_page_id") or "",
+                    max_chars=200,
+                )
+            with meta_col2:
+                instagram_user_id = st.text_input(
+                    "Instagram Professional ID (optional)",
+                    value=(active_connection or {}).get("instagram_user_id") or "",
+                    max_chars=200,
+                )
+            credential_ref = st.text_input(
+                "Credential Secret Name",
+                value=(active_connection or {}).get("credential_ref") or "",
+                placeholder="META_TOKEN_CLIENT_ABC",
+                max_chars=128,
+                help=(
+                    "Enter only the name of the environment/Streamlit secret containing the "
+                    "Page access token. Never paste the actual Meta token into this form."
+                ),
+            )
+            save_connection = st.form_submit_button(
+                "Save / Replace Meta Connection", use_container_width=True
+            )
+        if save_connection:
+            clean_connection_name = connection_name.strip()
+            clean_credential_ref = credential_ref.strip()
+            clean_facebook_page_id = facebook_page_id.strip()
+            clean_instagram_user_id = instagram_user_id.strip()
+            if not clean_connection_name:
+                st.error("Connection name is required.")
+            elif not clean_credential_ref:
+                st.error("Credential Secret Name is required.")
+            elif not clean_facebook_page_id and not clean_instagram_user_id:
+                st.error("Enter either a Facebook Page ID or an Instagram Professional ID.")
+            elif clean_facebook_page_id and not clean_facebook_page_id.isdigit():
+                st.error("Facebook Page ID must be numeric.")
+            elif clean_instagram_user_id and not clean_instagram_user_id.isdigit():
+                st.error("Instagram Professional ID must be numeric.")
+            else:
+                try:
+                    store.save_meta_connection(
+                        client_id=client["id"],
+                        connection_name=clean_connection_name,
+                        credential_ref=clean_credential_ref,
+                        facebook_page_id=clean_facebook_page_id,
+                        instagram_user_id=clean_instagram_user_id,
+                    )
+                except (PublishingStoreError, sqlite3.Error, ValueError) as error:
+                    st.error(f"Meta connection could not be saved: {error}")
+                else:
+                    st.success("Meta connection reference saved. No raw token was stored in SQLite.")
+                    if clean_facebook_page_id and clean_credential_ref:
+                        secret_present = bool(get_app_setting(clean_credential_ref))
+                        if not secret_present:
+                            st.warning(
+                                "The secret name is saved, but the actual token is not available yet. "
+                                "Add it to .streamlit/secrets.toml or your runtime environment before publishing."
+                            )
+                    st.rerun()
+
+    if not active_connection:
+        st.info("Save the client Meta destination before queueing publication jobs.")
+        return
+
+    try:
+        jobs = store.list_jobs(campaign["id"])
+    except (PublishingStoreError, sqlite3.Error, ValueError) as error:
+        st.warning(f"Publication history could not be loaded: {error}")
+        jobs = []
+    if jobs:
+        st.markdown("#### Publication Queue / History")
+        display_jobs = [
+            {
+                "Post": item["post_number"],
+                "Platform": str(item["platform"]).title(),
+                "Scheduled (UTC)": item["scheduled_for"],
+                "Status": item["status"],
+                "Platform Post ID": item.get("platform_post_id") or "",
+                "Error": item.get("error_code") or "",
+            }
+            for item in jobs
+        ]
+        st.dataframe(display_jobs, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Queue Approved Image Posts")
+    st.caption(
+        "Instagram requires the approved creative to be on a public HTTPS URL at publish "
+        "time. Production will use object storage/CDN; localhost or a laptop path cannot work."
+    )
+
+    asset_by_post = {int(item["post_number"]): item for item in latest_assets}
+    for brief in design_briefs:
+        post_number = int(brief["post_number"])
+        asset = asset_by_post.get(post_number)
+        if not asset or str(asset.get("latest_decision") or "").lower() != "approved":
+            continue
+        if str(asset.get("format") or "").strip().casefold() != "image":
+            st.info(
+                f"Post {post_number} ({asset.get('format')}): publishing waits for its "
+                "real platform-ready media pipeline."
+            )
+            continue
+        if str(asset.get("mime_type") or "").strip().lower() not in {"image/png", "image/jpeg"}:
+            st.info(f"Post {post_number}: phase-1 requires an approved PNG/JPEG creative.")
+            continue
+
+        st.markdown(f"**Post {post_number} — Image**")
+        destination_options = []
+        if active_connection.get("facebook_page_id"):
+            destination_options.append("Facebook")
+        if active_connection.get("instagram_user_id"):
+            destination_options.append("Instagram")
+        selected_platforms = st.multiselect(
+            "Destinations",
+            destination_options,
+            default=destination_options,
+            key=f"publish_platforms_{calendar['id']}_{post_number}",
+        )
+        supabase_url = get_app_setting("SUPABASE_URL")
+        supabase_service_key = get_app_setting("SUPABASE_SERVICE_ROLE_KEY")
+        supabase_bucket = get_app_setting("SUPABASE_MEDIA_BUCKET", "publishing-media")
+        supabase_ready = bool(supabase_url and supabase_service_key and supabase_bucket)
+        if supabase_ready:
+            st.caption(
+                "Media storage: Supabase configured. The exact Senior-approved creative "
+                "will be uploaded automatically when you publish/queue."
+            )
+            public_url = ""
+        else:
+            st.warning(
+                "Supabase media storage is not configured. For local testing you can "
+                "provide another public HTTPS URL manually."
+            )
+            public_url = st.text_input(
+                "Approved Creative Public HTTPS URL",
+                key=f"publish_media_url_{calendar['id']}_{post_number}",
+                placeholder="https://cdn.example.com/approved-creative.jpg",
+            )
+        timing = st.radio(
+            "Timing",
+            ("Publish now", "Schedule UTC"),
+            horizontal=True,
+            key=f"publish_timing_{calendar['id']}_{post_number}",
+        )
+        scheduled_for = None
+        if timing == "Schedule UTC":
+            date_col, time_col = st.columns(2)
+            with date_col:
+                scheduled_date = st.date_input(
+                    "Publish Date (UTC)",
+                    key=f"publish_date_{calendar['id']}_{post_number}",
+                )
+            with time_col:
+                scheduled_time = st.time_input(
+                    "Publish Time (UTC)",
+                    key=f"publish_time_{calendar['id']}_{post_number}",
+                )
+            scheduled_for = datetime.combine(
+                scheduled_date, scheduled_time, tzinfo=timezone.utc
+            )
+
+        if st.button(
+            "Queue Approved Post",
+            key=f"queue_publish_{calendar['id']}_{post_number}",
+            use_container_width=True,
+        ):
+            if not selected_platforms:
+                st.error("Select at least one destination.")
+                continue
+
+            effective_public_url = str(public_url or "").strip()
+            if supabase_ready:
+                creative_ok, _creative_path, creative_raw, creative_error = verify_creative_file_integrity(asset)
+                if not creative_ok:
+                    st.error(
+                        "The exact Senior-approved creative file is unavailable or changed, "
+                        f"so publishing is blocked. Details: {creative_error}"
+                    )
+                    continue
+                try:
+                    media_result = upload_public_creative(
+                        project_url=supabase_url,
+                        service_role_key=supabase_service_key,
+                        bucket=supabase_bucket,
+                        campaign_id=campaign["id"],
+                        post_number=post_number,
+                        creative_asset_id=asset["id"],
+                        creative_hash=asset["file_sha256"],
+                        file_bytes=creative_raw,
+                        mime_type=asset["mime_type"],
+                    )
+                except (SupabaseMediaError, TypeError, ValueError) as error:
+                    st.error(f"Approved creative could not be prepared for Meta: {error}")
+                    continue
+                effective_public_url = media_result.public_url
+
+            if not effective_public_url:
+                st.error("A public HTTPS creative URL is required before publishing.")
+                continue
+
+            queued = []
+            try:
+                for platform_label in selected_platforms:
+                    job = store.queue_image_publication(
+                        campaign_id=campaign["id"],
+                        calendar_version_id=calendar["id"],
+                        creative_asset_id=asset["id"],
+                        connection_id=active_connection["id"],
+                        platform=platform_label.lower(),
+                        public_media_url=effective_public_url,
+                        scheduled_for=scheduled_for,
+                    )
+                    queued.append(
+                        f"{platform_label}: {job['status']} ({job['scheduled_for']})"
+                    )
+            except (PublishingStoreError, sqlite3.Error, ValueError) as error:
+                st.error(f"Post {post_number} could not be queued: {error}")
+            else:
+                if timing == "Publish now":
+                    try:
+                        publish_summary = run_due_jobs(
+                            get_app_setting("CAMPAIGN_DB_PATH", str(DEFAULT_CAMPAIGN_DB_PATH)),
+                            limit=20,
+                            token_resolver=get_app_setting,
+                            api_version=get_app_setting(
+                                "META_GRAPH_API_VERSION", DEFAULT_META_GRAPH_API_VERSION
+                            ),
+                        )
+                    except (PublishingStoreError, sqlite3.Error, OSError, TypeError, ValueError) as error:
+                        st.error(f"Queued successfully, but immediate dispatch failed: {error}")
+                    else:
+                        st.success(
+                            "Publish run complete — "
+                            f"published={publish_summary['published']}, "
+                            f"failed={publish_summary['failed']}, "
+                            f"outcome_unknown={publish_summary['outcome_unknown']}."
+                        )
+                else:
+                    st.success("Scheduled — " + "; ".join(queued))
+                st.rerun()
+
+    st.caption(
+        "Publish now is dispatched immediately by this app. Scheduled jobs are processed "
+        "by publishing_worker.py or by AUTO_PUBLISH_WORKER=true on a single-instance POC "
+        "deployment. A publish timeout becomes outcome_unknown and is never blindly retried."
+    )
+
+
+def render_design_approval_dashboard(calendar, design_briefs, latest_assets):
+    """Make every Senior design decision and required action visible at a glance."""
+    if not design_briefs:
+        return
+    try:
+        rows = build_design_review_dashboard_rows(design_briefs, latest_assets)
+        gate = publishing_status(latest_assets, len(design_briefs))
+    except (TypeError, ValueError) as error:
+        st.warning(f"Design approval summary could not be prepared: {error}")
+        return
+
+    st.markdown("### Design Approval Status")
+    st.caption(
+        "Senior design decisions happen in a separate secure tab. Click refresh after the reviewer acts; "
+        "the latest approval or change request will be loaded from the database."
+    )
+    if st.button(
+        "Refresh Senior Design Status",
+        key=f"refresh_design_status_{calendar['id']}",
+        use_container_width=True,
+    ):
+        st.rerun()
+
+    counts = {
+        "approved": sum(1 for row in rows if row["status"] == "Design Approved"),
+        "changes": sum(1 for row in rows if row["status"] == "Design Changes Requested"),
+        "pending": sum(1 for row in rows if row["status"] == "Pending Senior Design Review"),
+        "remaining": sum(
+            1 for row in rows
+            if row["status"] in {"Design Brief Ready", "Creative Uploaded"}
+        ),
+    }
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Approved", counts["approved"])
+    col2.metric("Changes Requested", counts["changes"])
+    col3.metric("Pending Review", counts["pending"])
+    col4.metric("Not Sent / Missing", counts["remaining"])
+
+    if counts["changes"]:
+        st.error(
+            f"Action required: Senior requested design changes on {counts['changes']} post(s). "
+            "Review the feedback below, then upload a replacement creative version."
+        )
+
+    for row in rows:
+        post_label = f"Post {row['post_number']} — {row['format'] or 'Creative'}"
+        version_label = (
+            f"Creative v{row['asset_version']}" if row["asset_version"] is not None
+            else "No creative uploaded"
+        )
+        if row["status"] == "Design Approved":
+            st.success(f"✅ {post_label} — Design Approved — {version_label}")
+            reviewer = row.get("approver_name") or "Senior Reviewer"
+            decided_at = row.get("decided_at") or ""
+            detail = f"Approved by {reviewer}"
+            if decided_at:
+                detail += f" | {decided_at}"
+            st.caption(detail)
+        elif row["status"] == "Design Changes Requested":
+            st.error(f"🔴 {post_label} — Design Changes Requested — {version_label}")
+            if row.get("change_fields"):
+                st.markdown("**Change Areas:** " + ", ".join(row["change_fields"]))
+            if row.get("feedback"):
+                st.info(f"Senior Feedback: {row['feedback']}")
+            reviewer = row.get("approver_name") or "Senior Reviewer"
+            decided_at = row.get("decided_at") or ""
+            detail = f"Requested by {reviewer}"
+            if decided_at:
+                detail += f" | {decided_at}"
+            st.caption(detail)
+            st.caption(
+                f"Open Post {row['post_number']} below → Creative Production → "
+                "Upload Replacement Creative (new version)."
+            )
+        elif row["status"] == "Pending Senior Design Review":
+            st.warning(f"🟡 {post_label} — Pending Senior Design Review — {version_label}")
+            if row.get("active_review_expires_at"):
+                st.caption(f"Active review link expires: {row['active_review_expires_at']}")
+        elif row["status"] == "Creative Uploaded":
+            st.info(f"🔵 {post_label} — Creative Uploaded, Review Link Not Generated — {version_label}")
+            st.caption(
+                f"Open Post {row['post_number']} below and generate the Senior Design Review Link."
+            )
+        else:
+            st.caption(f"⚪ {post_label} — Design Brief Ready — upload the creative next.")
+
+    integrity_failures = []
+    for asset in latest_assets:
+        ok, _path, _raw, error = verify_creative_file_integrity(asset)
+        if not ok:
+            integrity_failures.append((int(asset["post_number"]), error))
+    if gate == PUBLISHING_STATUS_READY and not integrity_failures:
+        st.success(
+            "Publishing Gate: READY — every latest creative is Senior Design Approved "
+            "and its stored file passes integrity checks."
+        )
+    else:
+        st.warning(
+            "Publishing Gate: LOCKED — every post needs an approved, intact latest creative."
+        )
+        for post_number, error in integrity_failures:
+            st.caption(f"Post {post_number} file check: {error}")
+
+
+def render_creative_asset_controls(store, campaign, calendar, client, brief_record):
+    """Show provider-neutral prompt, upload/versioning, AI generation, and review controls."""
+    post_number = int(brief_record["post_number"])
+    brand_kit = None
+    if client:
+        try:
+            brand_record = store.get_latest_brand_kit(client["id"])
+            brand_kit = (brand_record or {}).get("kit")
+        except PERSISTENCE_EXCEPTIONS as error:
+            st.warning(f"Brand Kit could not be loaded for this creative: {error}")
+    try:
+        approved_post = content_post_by_number(
+            calendar["headers"],
+            calendar["rows"],
+            post_number,
+            week_heading_prefix=WEEK_HEADING_PREFIX,
+        )
+        prompt = build_branded_design_prompt(
+            brief_record["brief"],
+            approved_post,
+            client_metadata={
+                **dict(calendar.get("client_metadata") or {}),
+                "client_name": client.get("name") if client else "",
+                "language": (campaign.get("intake") or {}).get("language", ""),
+            },
+            brand_kit=brand_kit,
+        )
+    except (TypeError, ValueError) as error:
+        st.warning(f"Creative production controls are unavailable: {error}")
+        return
+
+    st.markdown("#### Creative Production")
+    st.caption(
+        "The prompt is provider-neutral: paste it into Canva or another design AI, "
+        "or create the design manually in any platform and upload the final file here."
+    )
+    st.markdown("**AI Design Prompt**")
+    st.code(prompt, language=None)
+
+    try:
+        assets = store.list_latest_creative_assets(campaign["id"], calendar["id"])
+    except PERSISTENCE_EXCEPTIONS as error:
+        st.warning(f"Creative status could not be loaded: {error}")
+        return
+    latest_asset = next(
+        (item for item in assets if int(item["post_number"]) == post_number), None
+    )
+
+    with st.expander("AI Creative Studio", expanded=False):
+        st.caption(
+            "Choose an image provider. Cloudflare Workers AI is the free-first default; "
+            "Gemini remains available as an optional provider. Both use the same Senior-approved "
+            "content, Design Brief and latest Brand Kit. Manual Upload remains available below."
+        )
+        if not brand_kit:
+            st.info(
+                "Brand Kit is not configured for this client. You can still generate a creative, "
+                "or configure the Brand Kit above for stronger consistency."
+            )
+        if latest_asset and latest_asset.get("latest_decision") == "approved":
+            st.info(
+                "The latest creative is already Senior Design Approved. Creating a new version "
+                "will reopen design review, so AI generation is disabled here unless a revised version is required."
+            )
+        else:
+            provider_options = ("Cloudflare Workers AI (Free)", "Gemini")
+            default_provider = str(
+                get_app_setting("DEFAULT_CREATIVE_PROVIDER", "cloudflare") or "cloudflare"
+            ).strip().casefold()
+            provider_index = 1 if default_provider == "gemini" else 0
+            creative_provider = st.selectbox(
+                "Creative Provider",
+                provider_options,
+                index=provider_index,
+                key=f"creative_provider_{calendar['id']}_{post_number}",
+            )
+            using_cloudflare = creative_provider.startswith("Cloudflare")
+
+            recommended_ratio = recommended_aspect_ratio(
+                brief_record.get("format", ""),
+                approved_post.get("content", {}).get("Platform", ""),
+            )
+            ratio_options = list(SUPPORTED_IMAGE_ASPECT_RATIOS)
+            creative_ratio = st.selectbox(
+                "Aspect Ratio",
+                ratio_options,
+                index=ratio_options.index(recommended_ratio) if recommended_ratio in ratio_options else 0,
+                key=f"creative_ratio_{calendar['id']}_{post_number}",
+            )
+
+            if using_cloudflare:
+                cloudflare_model = str(
+                    get_app_setting(
+                        "CLOUDFLARE_IMAGE_MODEL", DEFAULT_CLOUDFLARE_IMAGE_MODEL
+                    )
+                    or DEFAULT_CLOUDFLARE_IMAGE_MODEL
+                ).strip()
+                st.caption(
+                    "Cloudflare model: FLUX.1 Schnell • Free allocation resets daily. "
+                    "The selected aspect ratio is added as composition guidance because this "
+                    "model's REST schema does not expose width/height controls."
+                )
+                cloudflare_steps = st.slider(
+                    "Quality Steps",
+                    min_value=1,
+                    max_value=8,
+                    value=4,
+                    key=f"cloudflare_steps_{calendar['id']}_{post_number}",
+                    help="Higher values may improve detail but use more Workers AI compute.",
+                )
+                gemini_model = DEFAULT_GEMINI_IMAGE_MODEL
+                gemini_size = "1K"
+            else:
+                default_model = get_app_setting(
+                    "GEMINI_IMAGE_MODEL", DEFAULT_GEMINI_IMAGE_MODEL
+                )
+                model_options = list(SUPPORTED_GEMINI_IMAGE_MODELS)
+                if default_model not in model_options:
+                    default_model = DEFAULT_GEMINI_IMAGE_MODEL
+                gemini_model = st.selectbox(
+                    "Gemini Image Model",
+                    model_options,
+                    index=model_options.index(default_model),
+                    key=f"gemini_image_model_{calendar['id']}_{post_number}",
+                )
+                size_options = (
+                    ["1K"]
+                    if gemini_model == "gemini-3.1-flash-lite-image"
+                    else ["1K", "2K", "4K"]
+                )
+                gemini_size = st.selectbox(
+                    "Image Size",
+                    size_options,
+                    index=0,
+                    key=f"gemini_size_{calendar['id']}_{post_number}_{gemini_model}",
+                )
+                cloudflare_model = DEFAULT_CLOUDFLARE_IMAGE_MODEL
+                cloudflare_steps = 4
+
+            generation_prompt = prompt
+            is_revision = bool(
+                latest_asset and latest_asset.get("latest_decision") == "rejected"
+            )
+            if is_revision:
+                try:
+                    generation_prompt = build_design_revision_prompt(
+                        original_prompt=latest_asset.get("design_prompt") or prompt,
+                        senior_feedback=latest_asset.get("design_feedback") or "",
+                        change_fields=latest_asset.get("design_change_fields") or [],
+                        approved_post=approved_post,
+                        brand_kit=brand_kit,
+                    )
+                except (TypeError, ValueError) as error:
+                    st.warning(f"Revision prompt could not be prepared: {error}")
+                    generation_prompt = prompt
+                    is_revision = False
+
+            if is_revision and using_cloudflare:
+                st.caption(
+                    "Cloudflare revisions regenerate from the approved prompt plus Senior feedback. "
+                    "Gemini can also use the previous image as a visual reference when that project has image access."
+                )
+
+            provider_slug = "cloudflare" if using_cloudflare else "gemini"
+            editable_prompt = st.text_area(
+                "Creative Prompt",
+                value=generation_prompt,
+                height=320,
+                key=(
+                    f"creative_prompt_{provider_slug}_{calendar['id']}_{post_number}_"
+                    f"{latest_asset['id'] if latest_asset else 'new'}"
+                ),
+                help=(
+                    "You may refine visual direction, but do not change approved claims, CTA, "
+                    "platform, format, or Senior-approved content."
+                ),
+            )
+            generate_label = (
+                "Generate Revised Creative" if is_revision else "Generate Creative"
+            )
+            draft_key = (
+                f"creative_draft_{provider_slug}_{calendar['id']}_{post_number}_"
+                f"{latest_asset['id'] if latest_asset else 'new'}"
+            )
+
+            if st.button(
+                generate_label,
+                key=f"generate_{draft_key}",
+                use_container_width=True,
+            ):
+                generated = None
+                provider_metadata = {}
+                if using_cloudflare:
+                    cloudflare_account_id = get_app_setting("CLOUDFLARE_ACCOUNT_ID")
+                    cloudflare_token = get_app_setting("CLOUDFLARE_API_TOKEN")
+                    missing_cloudflare = []
+                    if not cloudflare_account_id:
+                        missing_cloudflare.append("CLOUDFLARE_ACCOUNT_ID")
+                    if not cloudflare_token:
+                        missing_cloudflare.append("CLOUDFLARE_API_TOKEN")
+                    if missing_cloudflare:
+                        st.error(
+                            "Cloudflare creative generation is not configured. Add "
+                            + " and ".join(missing_cloudflare)
+                            + " to local/deployment secrets."
+                        )
+                        st.caption(
+                            "Create a Workers AI API token in Cloudflare with Workers AI access. "
+                            "Do not paste the token into the app or commit it to GitHub."
+                        )
+                    else:
+                        with st.spinner(
+                            "Cloudflare is generating a revised creative..."
+                            if is_revision
+                            else "Cloudflare is generating the creative..."
+                        ):
+                            try:
+                                generated = generate_cloudflare_image(
+                                    prompt=editable_prompt,
+                                    account_id=cloudflare_account_id,
+                                    api_token=cloudflare_token,
+                                    model=cloudflare_model,
+                                    aspect_ratio=creative_ratio,
+                                    steps=cloudflare_steps,
+                                )
+                            except (CloudflareImageError, TypeError, ValueError) as error:
+                                if isinstance(error, CloudflareImageError):
+                                    st.error(
+                                        f"Creative generation could not complete: {error}"
+                                    )
+                                    if error.code == "CLOUDFLARE_RATE_LIMIT":
+                                        st.info(
+                                            "The Cloudflare free allocation/rate limit may be exhausted. "
+                                            "Retry after the allocation resets, switch to Gemini if enabled, "
+                                            "or continue with Manual Upload."
+                                        )
+                                    elif error.code == "CLOUDFLARE_AUTH_ERROR":
+                                        st.warning(
+                                            "Check CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN. "
+                                            "The token should have Workers AI access; never commit it to GitHub."
+                                        )
+                                    elif error.code == "CLOUDFLARE_INVALID_REQUEST":
+                                        st.info(
+                                            "Cloudflare rejected a request parameter. The provider detail "
+                                            "above should identify the unsupported value."
+                                        )
+                                    with st.expander("Technical details", expanded=False):
+                                        st.code(
+                                            f"Error code: {error.code}\nRequest ID: {error.request_id}",
+                                            language="text",
+                                        )
+                                else:
+                                    st.error(
+                                        f"Creative generation could not complete: {error}"
+                                    )
+                            else:
+                                provider_metadata = {
+                                    "requested_aspect_ratio": creative_ratio,
+                                    "steps": generated.steps,
+                                    "actual_width": generated.width,
+                                    "actual_height": generated.height,
+                                    "prompt_compacted": generated.prompt_compacted,
+                                    "provider_prompt_chars": generated.provider_prompt_chars,
+                                }
+                else:
+                    gemini_key = get_app_setting("GEMINI_API_KEY")
+                    if not gemini_key:
+                        st.error(
+                            "GEMINI_API_KEY is missing. Add a Gemini Developer API key to the server configuration."
+                        )
+                    else:
+                        reference_bytes = None
+                        reference_mime = ""
+                        if (
+                            is_revision
+                            and latest_asset
+                            and str(latest_asset.get("mime_type") or "").startswith("image/")
+                        ):
+                            ok, _path, raw_reference, _error = verify_creative_file_integrity(
+                                latest_asset
+                            )
+                            if ok:
+                                reference_bytes = raw_reference
+                                reference_mime = latest_asset["mime_type"]
+                        with st.spinner(
+                            "Gemini is generating a revised creative..."
+                            if is_revision
+                            else "Gemini is generating the creative..."
+                        ):
+                            try:
+                                generated = generate_image(
+                                    prompt=editable_prompt,
+                                    api_key=gemini_key,
+                                    model=gemini_model,
+                                    aspect_ratio=creative_ratio,
+                                    image_size=gemini_size,
+                                    reference_image_bytes=reference_bytes,
+                                    reference_image_mime_type=reference_mime,
+                                    api_url=get_app_setting(
+                                        "GEMINI_INTERACTIONS_URL",
+                                        "https://generativelanguage.googleapis.com/v1beta/interactions",
+                                    ),
+                                )
+                            except (GeminiAPIError, TypeError, ValueError) as error:
+                                if isinstance(error, GeminiAPIError):
+                                    st.error(
+                                        f"Creative generation could not complete: {error}"
+                                    )
+                                    if error.code == "GEMINI_BILLING_REQUIRED":
+                                        st.warning(
+                                            "Google reports that billing or another project prerequisite "
+                                            "is required for this request. Switch to Cloudflare Workers AI "
+                                            "or continue with Manual Upload without changing approvals."
+                                        )
+                                    elif error.code == "GEMINI_RATE_LIMIT":
+                                        st.info(
+                                            "The Gemini quota/rate limit is temporarily exhausted. Retry "
+                                            "later, switch to Cloudflare, or use Manual Upload."
+                                        )
+                                    elif error.code == "GEMINI_AUTH_ERROR":
+                                        st.warning(
+                                            "Check GEMINI_API_KEY in local/deployment secrets. Do not paste "
+                                            "the key into the app form or commit it to GitHub."
+                                        )
+                                    elif error.code == "GEMINI_MODEL_UNAVAILABLE":
+                                        st.info(
+                                            "Choose a model available to this Gemini project, switch to "
+                                            "Cloudflare, or verify Gemini image access."
+                                        )
+                                    elif error.code == "GEMINI_INVALID_REQUEST":
+                                        st.info(
+                                            "Google rejected one or more request parameters. The provider "
+                                            "detail above should identify the unsupported field or value."
+                                        )
+                                    with st.expander("Technical details", expanded=False):
+                                        st.code(
+                                            f"Error code: {error.code}\nRequest ID: {error.request_id}",
+                                            language="text",
+                                        )
+                                else:
+                                    st.error(
+                                        f"Creative generation could not complete: {error}"
+                                    )
+                            else:
+                                provider_metadata = {
+                                    "aspect_ratio": generated.aspect_ratio,
+                                    "image_size": generated.image_size,
+                                    "reference_image_used": bool(reference_bytes),
+                                }
+
+                if generated is not None:
+                    st.session_state[draft_key] = {
+                        "image_bytes": generated.image_bytes,
+                        "mime_type": generated.mime_type,
+                        "prompt": editable_prompt,
+                        "provider": provider_slug,
+                        "model": generated.model,
+                        "request_id": generated.request_id,
+                        "aspect_ratio": generated.aspect_ratio,
+                        "image_size": generated.image_size,
+                        "source_metadata": provider_metadata,
+                    }
+                    st.rerun()
+
+            draft = st.session_state.get(draft_key)
+            if draft:
+                st.markdown("**Generated Creative Preview**")
+                st.image(draft["image_bytes"])
+                provider_label = (
+                    "Cloudflare Workers AI"
+                    if draft["provider"] == "cloudflare"
+                    else "Gemini"
+                )
+                st.caption(
+                    f"{provider_label} • {draft['model']} | {draft['aspect_ratio']} | "
+                    f"{draft['image_size']} | Request ID: {draft['request_id']}"
+                )
+                if draft.get("source_metadata", {}).get("prompt_compacted"):
+                    st.info(
+                        "Cloudflare accepts prompts up to 2,048 characters. The provider request "
+                        "was safely compacted while preserving the opening concept and ending "
+                        "brand/constraint instructions. The full editable prompt remains stored "
+                        "with the creative version."
+                    )
+                st.caption(
+                    "Preview first. Save only the version you want to send through the existing Senior Design Review workflow."
+                )
+                if st.button(
+                    "Save as Creative Version",
+                    key=f"save_{draft_key}",
+                    use_container_width=True,
+                ):
+                    storage_path = None
+                    try:
+                        extension = generated_image_extension(draft["mime_type"])
+                        output_root = Path(
+                            get_app_setting(
+                                "CREATIVE_OUTPUT_DIR", str(DEFAULT_CREATIVE_OUTPUT_DIR)
+                            )
+                        )
+                        post_dir = output_root / campaign["id"] / f"post_{post_number:02d}"
+                        post_dir.mkdir(parents=True, exist_ok=True)
+                        storage_path = post_dir / f"{uuid4().hex}{extension}"
+                        storage_path.write_bytes(draft["image_bytes"])
+                        store.save_creative_asset(
+                            campaign["id"],
+                            calendar["id"],
+                            calendar["content_hash"],
+                            post_number,
+                            file_name=(
+                                f"{draft['provider']}_post_{post_number}_creative{extension}"
+                            ),
+                            mime_type=draft["mime_type"],
+                            storage_path=str(storage_path),
+                            file_sha256=hashlib.sha256(draft["image_bytes"]).hexdigest(),
+                            file_size=len(draft["image_bytes"]),
+                            source_type="ai_generated",
+                            design_prompt=draft["prompt"],
+                            source_provider=draft["provider"],
+                            source_model=draft["model"],
+                            source_request_id=draft["request_id"],
+                            source_metadata=draft.get("source_metadata") or {},
+                        )
+                    except (OSError, PERSISTENCE_EXCEPTIONS, TypeError, ValueError) as error:
+                        if storage_path is not None:
+                            storage_path.unlink(missing_ok=True)
+                        st.error(f"Generated creative could not be saved safely: {error}")
+                    else:
+                        st.session_state.pop(draft_key, None)
+                        st.success(
+                            "Creative saved as a new immutable version. Send it for Senior Design Review."
+                        )
+                        st.rerun()
+
+    if latest_asset:
+        st.markdown(f"**Creative Status:** {creative_status(latest_asset)}")
+        source_provider = str(latest_asset.get("source_provider") or "").strip()
+        source_model = str(latest_asset.get("source_model") or "").strip()
+        if latest_asset.get("source_type") == "ai_generated":
+            source_text = source_provider.title() if source_provider else "AI"
+            if source_model:
+                source_text += f" ({source_model})"
+            st.caption(f"Creative source: {source_text}")
+        elif source_provider:
+            st.caption(f"Creative source: {source_provider.title()}")
+        creative_file_ok = render_creative_file(
+            latest_asset, key_prefix=f"dashboard_{latest_asset['id']}"
+        )
+        if not creative_file_ok:
+            st.error(
+                "Senior review is blocked for this version. Upload the creative again as a new version."
+            )
+        if latest_asset.get("latest_decision") == "rejected":
+            st.error("Senior Design Changes Requested — upload a revised creative as a new version.")
+            fields = ", ".join(latest_asset.get("design_change_fields") or [])
+            if fields:
+                st.markdown(f"**Senior requested changes in:** {fields}")
+            if latest_asset.get("design_feedback"):
+                st.info(f"Senior Feedback: {latest_asset['design_feedback']}")
+            reviewer = latest_asset.get("design_approver_name") or "Senior Reviewer"
+            decided_at = latest_asset.get("design_decided_at") or ""
+            rejection_text = f"Requested by {reviewer}"
+            if decided_at:
+                rejection_text += f" | {decided_at}"
+            st.caption(rejection_text)
+        elif latest_asset.get("latest_decision") == "approved":
+            st.success("This creative version is Senior Design Approved.")
+            reviewer = latest_asset.get("design_approver_name") or "Senior Reviewer"
+            decided_at = latest_asset.get("design_decided_at") or ""
+            approval_text = f"Approved by {reviewer}"
+            if decided_at:
+                approval_text += f" | {decided_at}"
+            st.caption(approval_text)
+
+        if latest_asset.get("active_review_link") and not st.session_state.get(
+            f"design_review_url_{latest_asset['id']}"
+        ):
+            st.warning(
+                "A Senior Design Review link is active. For security the raw URL is not stored. "
+                "If you no longer have the URL, generate a replacement link below."
+            )
+
+        if latest_asset.get("latest_decision") != "approved" and creative_file_ok:
+            review_button_label = (
+                "Replace Senior Design Review Link"
+                if latest_asset.get("active_review_link")
+                else "Generate Senior Design Review Link"
+            )
+            if st.button(
+                review_button_label,
+                key=f"create_design_review_{latest_asset['id']}",
+                use_container_width=True,
+            ):
+                try:
+                    raw_token = generate_review_token()
+                    token_hash = hash_design_review_token(raw_token)
+                    expires_at = (
+                        datetime.now(timezone.utc) + timedelta(hours=review_link_ttl_hours())
+                    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                    store.create_design_review_link(
+                        latest_asset["id"], token_hash, expires_at
+                    )
+                    url = build_design_review_url(configured_public_base_url(), raw_token)
+                    st.session_state[f"design_review_url_{latest_asset['id']}"] = url
+                    st.rerun()
+                except PERSISTENCE_EXCEPTIONS as error:
+                    st.error(f"Design review link could not be created: {error}")
+                except ValueError as error:
+                    st.error(str(error))
+            saved_url = st.session_state.get(f"design_review_url_{latest_asset['id']}")
+            if saved_url:
+                st.markdown("**Senior Design Review Link**")
+                st.code(saved_url, language=None)
+                st.caption(
+                    "Share this URL only with the intended Senior reviewer. Creating a replacement revokes the prior pending link."
+                )
+
+            st.caption(
+                "After the Senior approves or requests changes in the shared link, click Refresh below. "
+                "Do not generate a replacement link just to check the decision."
+            )
+            if st.button(
+                "Refresh Senior Design Status",
+                key=f"refresh_design_status_post_{calendar['id']}_{post_number}_{latest_asset['id']}",
+                use_container_width=True,
+            ):
+                st.rerun()
+
+    if latest_asset and latest_asset.get("latest_decision") == "approved":
+        st.warning(
+            "Uploading a new creative after approval creates a new latest version and re-locks publishing until that version is approved."
+        )
+        upload_label = "Upload New Creative (reopens Senior design approval)"
+    elif latest_asset:
+        upload_label = "Upload Replacement Creative (new version)"
+    else:
+        upload_label = "Upload Creative"
+    uploaded = st.file_uploader(
+        upload_label,
+        type=["png", "jpg", "jpeg", "pdf"],
+        key=f"creative_upload_{calendar['id']}_{post_number}_{latest_asset['asset_version'] if latest_asset else 0}",
+        help="PNG, JPG/JPEG, or PDF up to 12 MB. The design can come from Canva, Figma, Photoshop, another AI tool, or a manual designer.",
+    )
+    if uploaded is not None and st.button(
+        "Save Creative Version",
+        key=f"save_creative_{calendar['id']}_{post_number}_{latest_asset['asset_version'] if latest_asset else 0}",
+        use_container_width=True,
+    ):
+        raw = uploaded.getvalue()
+        try:
+            prepared_upload = prepare_image_for_approved_platforms(
+                file_bytes=raw,
+                mime_type=uploaded.type,
+                file_name=uploaded.name,
+                approved_platform_text=approved_post.get("content", {}).get("Platform", ""),
+                format_name=brief_record.get("format", ""),
+            )
+            raw = prepared_upload.file_bytes
+            metadata = validate_creative_upload(
+                prepared_upload.file_name, prepared_upload.mime_type, raw
+            )
+            if prepared_upload.converted:
+                st.info(prepared_upload.note)
+            output_root = Path(
+                get_app_setting("CREATIVE_OUTPUT_DIR", str(DEFAULT_CREATIVE_OUTPUT_DIR))
+            )
+            post_dir = output_root / campaign["id"] / f"post_{post_number:02d}"
+            post_dir.mkdir(parents=True, exist_ok=True)
+            storage_path = post_dir / f"{uuid4().hex}{metadata['extension']}"
+            storage_path.write_bytes(raw)
+            try:
+                store.save_creative_asset(
+                    campaign["id"],
+                    calendar["id"],
+                    calendar["content_hash"],
+                    post_number,
+                    file_name=metadata["file_name"],
+                    mime_type=metadata["mime_type"],
+                    storage_path=str(storage_path),
+                    file_sha256=metadata["file_sha256"],
+                    file_size=metadata["file_size"],
+                    source_type="manual_upload",
+                    design_prompt=prompt,
+                )
+            except Exception:
+                storage_path.unlink(missing_ok=True)
+                raise
+        except PERSISTENCE_EXCEPTIONS as error:
+            st.error(f"Creative could not be saved safely: {error}")
+        else:
+            st.success("Creative version saved. It is ready for Senior Design Review.")
+            st.rerun()
+
+
+if REVIEW_MODE_TOKEN and DESIGN_REVIEW_MODE_TOKEN:
+    st.error("Use only one review capability link at a time.")
+    st.stop()
+if DESIGN_REVIEW_MODE_TOKEN:
+    render_design_review_portal(campaign_store, DESIGN_REVIEW_MODE_TOKEN)
+    st.stop()
 if REVIEW_MODE_TOKEN:
     render_senior_review_portal(campaign_store, REVIEW_MODE_TOKEN)
     st.stop()
@@ -1235,7 +2842,7 @@ with st.form("client_form"):
         max_upload_size=MAX_REFERENCE_FILE_BYTES // (1024 * 1024),
         help=(
             "Upload a client brief, brochure, or service document (maximum 5 MB). "
-            "Only extracted text is sent to Groq; upload material you are allowed to share."
+            "Only extracted text is sent to the configured AI provider; upload material you are allowed to share."
         ),
     )
 
@@ -1401,8 +3008,8 @@ Rules:
     groq_api_key = get_app_setting("GROQ_API_KEY")
     groq_api_url = get_app_setting("GROQ_API_URL", DEFAULT_GROQ_API_URL)
     groq_model = get_app_setting("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-    n8n_webhook_url = get_app_setting("N8N_CALENDAR_WEBHOOK_URL")
-    n8n_webhook_secret = get_app_setting("N8N_WEBHOOK_SECRET")
+    if generation_provider == "gemini":
+        groq_model = get_app_setting("GEMINI_TEXT_MODEL", DEFAULT_GEMINI_TEXT_MODEL)
 
     if input_error:
         st.error(input_error)
@@ -1414,31 +3021,26 @@ Rules:
         st.error(campaign_error)
     elif content_mix_error:
         st.error(content_mix_error)
-    elif generation_provider not in {"groq", "n8n"}:
+    elif generation_provider not in {"groq", "gemini"}:
         st.error(
-            "CALENDAR_GENERATION_PROVIDER must be either 'groq' or 'n8n'."
+            "CALENDAR_GENERATION_PROVIDER must be 'groq' or 'gemini'."
         )
     elif generation_provider == "groq" and not groq_api_key:
         st.error(
             "GROQ_API_KEY is missing. Add it to the environment or "
             ".streamlit/secrets.toml and restart the app."
         )
-    elif generation_provider == "n8n" and not n8n_webhook_url:
+    elif generation_provider == "gemini" and not get_app_setting("GEMINI_API_KEY"):
         st.error(
-            "N8N_CALENDAR_WEBHOOK_URL is missing. Add the active production "
-            "webhook URL to the server configuration."
-        )
-    elif generation_provider == "n8n" and not n8n_webhook_secret:
-        st.error(
-            "N8N_WEBHOOK_SECRET is missing. Add the same header-auth secret "
-            "that is configured in n8n."
+            "GEMINI_API_KEY is missing. Add a Gemini Developer API key to the "
+            "environment or .streamlit/secrets.toml and restart the app."
         )
     elif campaign_store is None:
         st.error(
             "Campaign storage is unavailable, so no generation request was sent."
         )
     else:
-        generation_label = "n8n" if generation_provider == "n8n" else "Groq"
+        generation_label = {"groq": "Groq", "gemini": "Gemini"}[generation_provider]
         request_id = str(uuid4())
         client_data = {
             "client_name": client_name.strip(),
@@ -1541,15 +3143,15 @@ Rules:
                         expected_posts=posts,
                         groq_api_key=groq_api_key,
                         groq_api_url=groq_api_url,
-                        n8n_webhook_url=n8n_webhook_url,
-                        n8n_webhook_secret=n8n_webhook_secret,
+                        gemini_api_key=get_app_setting("GEMINI_API_KEY"),
+                        gemini_api_url=get_app_setting("GEMINI_INTERACTIONS_URL", DEFAULT_GEMINI_INTERACTIONS_URL),
                         campaign_id=campaign_id,
                         request_id=request_id,
                     )
                 except GenerationProviderError as provider_error:
                     outcome_uncertain = provider_error.code in {
                         "GROQ_TIMEOUT",
-                        "N8N_TIMEOUT",
+                        "GEMINI_TIMEOUT",
                     }
                     failure_status = (
                         "generation_unknown"
@@ -1718,6 +3320,7 @@ if "result" in st.session_state:
     latest_calendar = None
     client_record = None
     design_briefs = []
+    latest_creative_assets = []
 
     if campaign_store is not None and campaign_id:
         try:
@@ -1739,8 +3342,24 @@ if "result" in st.session_state:
             st.warning(f"Design brief status could not be loaded: {design_load_error}")
             design_briefs = []
 
+    if campaign_store is not None and campaign_id and latest_calendar is not None:
+        try:
+            latest_creative_assets = campaign_store.list_latest_creative_assets(
+                campaign_id, latest_calendar["id"]
+            )
+        except PERSISTENCE_EXCEPTIONS as creative_load_error:
+            st.warning(f"Creative status could not be loaded: {creative_load_error}")
+            latest_creative_assets = []
+
+    if latest_calendar is not None and design_briefs:
+        render_design_approval_dashboard(
+            latest_calendar, design_briefs, latest_creative_assets
+        )
+
     if client_record is not None:
         st.caption(f"Client: {client_record['name']}")
+        if campaign_store is not None:
+            render_brand_kit_editor(campaign_store, client_record)
     st.markdown("**Campaign ID**")
     st.code(str(campaign_id or "Unavailable"), language=None)
     if latest_calendar is not None:
@@ -1774,8 +3393,13 @@ if "result" in st.session_state:
                 campaign_record is not None
                 and campaign_record.get("status") in {"fully_approved", "approved"}
             )
+            latest_asset_by_post = {
+                int(item["post_number"]): item for item in latest_creative_assets
+            }
             design_status_by_post = {
-                int(item["post_number"]): DESIGN_STATUS_BRIEF_READY
+                int(item["post_number"]): creative_status(
+                    latest_asset_by_post.get(int(item["post_number"]))
+                )
                 for item in design_briefs
             }
             design_status_default = (
@@ -1851,6 +3475,13 @@ if "result" in st.session_state:
             st.success(
                 f"Design briefs ready for {len(design_briefs)} approved post(s)."
             )
+            current_publishing_status = publishing_status(
+                latest_creative_assets, len(design_briefs)
+            )
+            if current_publishing_status == PUBLISHING_STATUS_READY:
+                st.success("Publishing Gate: Ready — every latest creative is Senior Design Approved.")
+            else:
+                st.info("Publishing Gate: Locked until every latest creative is Senior Design Approved.")
             for record in design_briefs:
                 brief = record["brief"]
                 with st.expander(
@@ -1865,6 +3496,27 @@ if "result" in st.session_state:
                                 st.write(f"{item_index}. {item}")
                         else:
                             st.write(section_value)
+                    if campaign_store is not None and campaign_record is not None:
+                        render_creative_asset_controls(
+                            campaign_store,
+                            campaign_record,
+                            latest_calendar,
+                            client_record,
+                            record,
+                        )
+            if (
+                publishing_store is not None
+                and campaign_record is not None
+                and client_record is not None
+            ):
+                render_meta_publishing_panel(
+                    publishing_store,
+                    campaign_record,
+                    latest_calendar,
+                    client_record,
+                    design_briefs,
+                    latest_creative_assets,
+                )
         elif campaign_store is not None and latest_calendar is not None:
             if st.button(
                 "Generate Design Briefs",
@@ -1880,33 +3532,33 @@ if "result" in st.session_state:
                     "GROQ_API_URL", DEFAULT_GROQ_API_URL
                 )
                 brief_model = get_app_setting("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-                brief_n8n_url = get_app_setting("N8N_CALENDAR_WEBHOOK_URL")
-                brief_n8n_secret = get_app_setting("N8N_WEBHOOK_SECRET")
+                if brief_provider == "gemini":
+                    brief_model = get_app_setting("GEMINI_TEXT_MODEL", DEFAULT_GEMINI_TEXT_MODEL)
 
                 brief_config_error = None
-                if brief_provider not in {"groq", "n8n"}:
+                if brief_provider not in {"groq", "gemini"}:
                     brief_config_error = (
-                        "CALENDAR_GENERATION_PROVIDER must be either 'groq' or 'n8n'."
+                        "CALENDAR_GENERATION_PROVIDER must be 'groq' or 'gemini'."
                     )
                 elif brief_provider == "groq" and not brief_groq_key:
                     brief_config_error = "GROQ_API_KEY is missing."
-                elif brief_provider == "n8n" and not brief_n8n_url:
-                    brief_config_error = "N8N_CALENDAR_WEBHOOK_URL is missing."
-                elif brief_provider == "n8n" and not brief_n8n_secret:
-                    brief_config_error = "N8N_WEBHOOK_SECRET is missing."
-
-                if brief_config_error:
-                    st.error(brief_config_error)
+                elif brief_provider == "gemini" and not get_app_setting("GEMINI_API_KEY"):
+                    brief_config_error = "GEMINI_API_KEY is missing."
                 else:
                     brief_request_id = str(uuid4())
-                    brief_label = "n8n" if brief_provider == "n8n" else "Groq"
+                    brief_label = {"groq": "Groq", "gemini": "Gemini"}[brief_provider]
                     try:
-                        brief_prompt, source_posts = build_design_brief_prompt(
+                        brief_prompt, source_posts = build_brand_aware_design_brief_prompt(
                             latest_calendar["headers"],
                             latest_calendar["rows"],
                             week_heading_prefix=WEEK_HEADING_PREFIX,
                             client_metadata=latest_calendar.get("client_metadata"),
                             campaign_intake=(campaign_record or {}).get("intake", {}),
+                            brand_kit=(
+                                (campaign_store.get_latest_brand_kit(client_record["id"]) or {}).get("kit")
+                                if client_record is not None
+                                else None
+                            ),
                         )
                     except PERSISTENCE_EXCEPTIONS as brief_prompt_error:
                         st.error(f"Design brief request could not be prepared: {brief_prompt_error}")
@@ -1924,8 +3576,8 @@ if "result" in st.session_state:
                                     expected_posts=len(source_posts),
                                     groq_api_key=brief_groq_key,
                                     groq_api_url=brief_groq_url,
-                                    n8n_webhook_url=brief_n8n_url,
-                                    n8n_webhook_secret=brief_n8n_secret,
+                                    gemini_api_key=get_app_setting("GEMINI_API_KEY"),
+                                    gemini_api_url=get_app_setting("GEMINI_INTERACTIONS_URL", DEFAULT_GEMINI_INTERACTIONS_URL),
                                     campaign_id=campaign_id,
                                     request_id=brief_request_id,
                                 )
@@ -2042,23 +3694,18 @@ if "result" in st.session_state:
                             "GROQ_API_URL", DEFAULT_GROQ_API_URL
                         )
                         revision_model = get_app_setting("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-                        revision_n8n_url = get_app_setting("N8N_CALENDAR_WEBHOOK_URL")
-                        revision_n8n_secret = get_app_setting("N8N_WEBHOOK_SECRET")
+                        if revision_provider == "gemini":
+                            revision_model = get_app_setting("GEMINI_TEXT_MODEL", DEFAULT_GEMINI_TEXT_MODEL)
 
                         revision_config_error = None
-                        if revision_provider not in {"groq", "n8n"}:
+                        if revision_provider not in {"groq", "gemini"}:
                             revision_config_error = (
-                                "CALENDAR_GENERATION_PROVIDER must be either 'groq' or 'n8n'."
+                                "CALENDAR_GENERATION_PROVIDER must be 'groq' or 'gemini'."
                             )
                         elif revision_provider == "groq" and not revision_groq_key:
                             revision_config_error = "GROQ_API_KEY is missing."
-                        elif revision_provider == "n8n" and not revision_n8n_url:
-                            revision_config_error = "N8N_CALENDAR_WEBHOOK_URL is missing."
-                        elif revision_provider == "n8n" and not revision_n8n_secret:
-                            revision_config_error = "N8N_WEBHOOK_SECRET is missing."
-
-                        if revision_config_error:
-                            st.error(revision_config_error)
+                        elif revision_provider == "gemini" and not get_app_setting("GEMINI_API_KEY"):
+                            revision_config_error = "GEMINI_API_KEY is missing."
                         else:
                             revision_request_id = str(uuid4())
                             revision_prompt = build_field_revision_prompt(
@@ -2070,7 +3717,7 @@ if "result" in st.session_state:
                                 client_metadata=latest_calendar.get("client_metadata"),
                                 campaign_intake=(campaign_record or {}).get("intake", {}),
                             )
-                            revision_label = "n8n" if revision_provider == "n8n" else "Groq"
+                            revision_label = {"groq": "Groq", "gemini": "Gemini"}[revision_provider]
                             with st.spinner(
                                 f"Regenerating {', '.join(fields_to_change)} for {scope_text} "
                                 f"through {revision_label} ({revision_model})..."
@@ -2084,8 +3731,8 @@ if "result" in st.session_state:
                                         expected_posts=len(target_posts),
                                         groq_api_key=revision_groq_key,
                                         groq_api_url=revision_groq_url,
-                                        n8n_webhook_url=revision_n8n_url,
-                                        n8n_webhook_secret=revision_n8n_secret,
+                                        gemini_api_key=get_app_setting("GEMINI_API_KEY"),
+                                        gemini_api_url=get_app_setting("GEMINI_INTERACTIONS_URL", DEFAULT_GEMINI_INTERACTIONS_URL),
                                         campaign_id=campaign_id,
                                         request_id=revision_request_id,
                                     )

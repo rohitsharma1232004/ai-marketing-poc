@@ -109,6 +109,35 @@ def _validate_api_key(api_key: str, request_id: str) -> str:
     return value
 
 
+
+def _provider_error_details(response: Any, *, api_key: str = "") -> tuple[str, str]:
+    """Extract a bounded, safe provider code/message from Gemini error JSON."""
+
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return "", ""
+    if not isinstance(payload, Mapping):
+        return "", ""
+    raw_error = payload.get("error")
+    if not isinstance(raw_error, Mapping):
+        return "", ""
+
+    provider_code = str(raw_error.get("code") or raw_error.get("status") or "").strip()
+    provider_message = re.sub(
+        r"\s+", " ", str(raw_error.get("message") or "")
+    ).strip()
+    if api_key and api_key in provider_message:
+        provider_message = provider_message.replace(api_key, "[redacted]")
+    if len(provider_message) > 600:
+        provider_message = provider_message[:597] + "..."
+    return provider_code, provider_message
+
+
+def _provider_suffix(provider_message: str) -> str:
+    return f" Google response: {provider_message}" if provider_message else ""
+
+
 def _post_interaction(
     *,
     payload: Mapping[str, Any],
@@ -169,22 +198,55 @@ def _post_interaction(
             code="GEMINI_RESPONSE_TOO_LARGE",
         )
     status_code = int(getattr(response, "status_code", 0))
+    provider_code, provider_message = _provider_error_details(response, api_key=key)
+    normalized_provider_code = provider_code.strip().casefold().replace("-", "_")
+    normalized_provider_message = provider_message.casefold()
+    suffix = _provider_suffix(provider_message)
+
+    billing_blocked = (
+        normalized_provider_code == "failed_precondition"
+        or "billing" in normalized_provider_message
+        or "paid plan" in normalized_provider_message
+        or "payment" in normalized_provider_message
+    )
+    if status_code >= 400 and billing_blocked:
+        raise GeminiAPIError(
+            "Gemini cannot run this request because billing or another required project "
+            "prerequisite is not enabled." + suffix,
+            request_id=request_id,
+            code="GEMINI_BILLING_REQUIRED",
+        )
     if status_code in {401, 403}:
         raise GeminiAPIError(
-            "The configured Gemini API key is invalid or unauthorized.",
+            "The configured Gemini API key is invalid or unauthorized." + suffix,
             request_id=request_id,
             code="GEMINI_AUTH_ERROR",
         )
     if status_code == 429:
         raise GeminiAPIError(
-            "Gemini API quota or rate limit reached. Check Google AI Studio billing/quota.",
+            "Gemini API quota or rate limit was reached." + suffix,
             request_id=request_id,
             code="GEMINI_RATE_LIMIT",
             retryable=True,
         )
+    if status_code == 404 or (
+        "model" in normalized_provider_message
+        and ("not found" in normalized_provider_message or "not available" in normalized_provider_message)
+    ):
+        raise GeminiAPIError(
+            "The selected Gemini model is not available for this project or endpoint." + suffix,
+            request_id=request_id,
+            code="GEMINI_MODEL_UNAVAILABLE",
+        )
+    if status_code == 400:
+        raise GeminiAPIError(
+            "Gemini rejected the request parameters." + suffix,
+            request_id=request_id,
+            code="GEMINI_INVALID_REQUEST",
+        )
     if status_code < 200 or status_code >= 300:
         raise GeminiAPIError(
-            "Gemini returned an upstream error.",
+            "Gemini returned an upstream error." + suffix,
             request_id=request_id,
             code="GEMINI_UPSTREAM_ERROR",
             retryable=status_code >= 500,
@@ -354,7 +416,7 @@ def generate_image(
         "store": False,
         "response_format": {
             "type": "image",
-            "mime_type": "image/png",
+            "mime_type": "image/jpeg",
             "aspect_ratio": ratio,
             "image_size": size,
         },
@@ -382,7 +444,7 @@ def generate_image(
             code="GEMINI_IMAGE_MISSING",
             retryable=True,
         )
-    mime_type = str(image_block.get("mime_type") or "image/png").lower()
+    mime_type = str(image_block.get("mime_type") or "image/jpeg").lower()
     if mime_type not in SUPPORTED_REFERENCE_IMAGE_MIME_TYPES:
         raise GeminiAPIError(
             "Gemini returned an unsupported image type.",

@@ -16,6 +16,8 @@ from uuid import uuid4
 
 import requests
 
+from publishing_analytics import normalize_insights_payload, summarize_performance
+
 DEFAULT_META_GRAPH_BASE_URL = "https://graph.facebook.com"
 DEFAULT_META_GRAPH_API_VERSION = "v25.0"
 META_API_VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+$")
@@ -47,6 +49,10 @@ class MetaPublishError(RuntimeError):
         self.code = code
         self.retryable = retryable
         self.outcome_unknown = outcome_unknown
+
+
+class MetaInsightsError(RuntimeError):
+    """Raised when a Meta insight request cannot be completed safely."""
 
 
 def _clean_id(value: str, label: str) -> str:
@@ -346,3 +352,61 @@ def publish_instagram_image(
         request_id=correlation_id,
         container_id=container_id,
     )
+
+
+def fetch_post_insights(
+    *,
+    object_id: str,
+    page_access_token: str,
+    metric_names: Sequence[str] | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    request_id: str | None = None,
+    api_version: str = DEFAULT_META_GRAPH_API_VERSION,
+    base_url: str = DEFAULT_META_GRAPH_BASE_URL,
+    http_client: Any = requests,
+) -> dict[str, float]:
+    """Fetch and normalize a single Meta post's insight summary."""
+
+    correlation_id = request_id or str(uuid4())
+    clean_object_id = _clean_id(object_id, "object_id")
+    token = _clean_token(page_access_token, correlation_id)
+    version = _clean_version(api_version)
+    base = _clean_base_url(base_url)
+    metrics = tuple(str(item).strip() for item in (metric_names or (
+        "post_impressions_unique",
+        "post_engaged_users",
+        "post_clicks_unique",
+        "post_reactions_by_type_total",
+        "post_comments_by_type_total",
+        "post_shares",
+        "post_saves",
+    ))) if item else ()
+    if not metrics:
+        raise MetaInsightsError("At least one Meta insight metric is required.",)
+
+    params = {"access_token": token, "metric": ",".join(metrics)}
+    if since:
+        params["since"] = str(since)
+    if until:
+        params["until"] = str(until)
+
+    url = f"{base}/{version}/{clean_object_id}/insights"
+    try:
+        response = http_client.get(
+            url,
+            params=params,
+            headers={
+                "User-Agent": "AI-Marketing-POC/1.0",
+                "X-Request-ID": correlation_id,
+            },
+            timeout=(5, 60),
+        )
+    except requests.exceptions.RequestException as error:
+        raise MetaInsightsError(
+            f"Meta insight lookup failed for object {clean_object_id}.",
+        ) from error
+
+    data = _raise_for_status(response, request_id=correlation_id, action="fetching Meta insights")
+    normalized = normalize_insights_payload(data)
+    return summarize_performance(normalized)

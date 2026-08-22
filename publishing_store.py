@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from publishing_analytics import SUPPORTED_ANALYTICS_WINDOWS, summarize_performance
 from publishing_workflow import (
     approved_post_from_row,
     normalize_credential_ref,
@@ -158,6 +159,29 @@ class PublishingStore:
                 """
             )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS publication_metrics (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    campaign_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    metric_window TEXT NOT NULL CHECK (metric_window IN ('24h','7d','30d')),
+                    impressions REAL NOT NULL DEFAULT 0,
+                    reach REAL NOT NULL DEFAULT 0,
+                    clicks REAL NOT NULL DEFAULT 0,
+                    saves REAL NOT NULL DEFAULT 0,
+                    shares REAL NOT NULL DEFAULT 0,
+                    comments REAL NOT NULL DEFAULT 0,
+                    reactions REAL NOT NULL DEFAULT 0,
+                    engagement REAL NOT NULL DEFAULT 0,
+                    engagement_rate REAL NOT NULL DEFAULT 0,
+                    collected_at TEXT NOT NULL,
+                    UNIQUE(job_id, metric_window),
+                    FOREIGN KEY (job_id) REFERENCES publication_jobs(id) ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS meta_connections_one_active_client "
                 "ON meta_connections(client_id) WHERE status='active'"
             )
@@ -168,6 +192,10 @@ class PublishingStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS publication_jobs_campaign_idx "
                 "ON publication_jobs(campaign_id, post_number, platform, created_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS publication_metrics_campaign_idx "
+                "ON publication_metrics(campaign_id, metric_window, collected_at)"
             )
             connection.commit()
 
@@ -478,6 +506,112 @@ class PublishingStore:
                 "ORDER BY created_at DESC,rowid DESC LIMIT ?",
                 (str(campaign_id or "").strip(), limit),
             ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_job_insights(
+        self,
+        job_id: str,
+        *,
+        metric_window: str,
+        metrics: Mapping[str, Any],
+        collected_at: str | datetime | None = None,
+    ) -> dict[str, Any]:
+        clean_id = str(job_id or "").strip()
+        if not clean_id:
+            raise ValueError("job_id must not be empty.")
+        window = str(metric_window or "").strip()
+        if window not in SUPPORTED_ANALYTICS_WINDOWS:
+            raise ValueError("metric_window must be one of 24h, 7d, or 30d.")
+        summary = summarize_performance(metrics)
+        event_time = normalize_scheduled_for(collected_at) if collected_at is not None else _utc_now()
+        with self._new_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT campaign_id, platform, status FROM publication_jobs WHERE id=?",
+                (clean_id,),
+            ).fetchone()
+            if row is None:
+                raise PublishingNotFound("Publication job was not found.")
+            if row["status"] != "published":
+                raise PublishingConflict("Only published jobs can receive analytics.")
+            metric_id = str(uuid4())
+            connection.execute(
+                "INSERT INTO publication_metrics ("
+                "id,job_id,campaign_id,platform,metric_window,impressions,reach,clicks,"
+                "saves,shares,comments,reactions,engagement,engagement_rate,collected_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(job_id, metric_window) DO UPDATE SET "
+                "impressions=excluded.impressions, reach=excluded.reach, clicks=excluded.clicks, "
+                "saves=excluded.saves, shares=excluded.shares, comments=excluded.comments, "
+                "reactions=excluded.reactions, engagement=excluded.engagement, "
+                "engagement_rate=excluded.engagement_rate, collected_at=excluded.collected_at",
+                (
+                    metric_id,
+                    clean_id,
+                    row["campaign_id"],
+                    row["platform"],
+                    window,
+                    summary["impressions"],
+                    summary["reach"],
+                    summary["clicks"],
+                    summary["saves"],
+                    summary["shares"],
+                    summary["comments"],
+                    summary["reactions"],
+                    summary["engagement"],
+                    summary["engagement_rate"],
+                    event_time,
+                ),
+            )
+            connection.commit()
+        return self.get_job_metrics(clean_id, metric_window=window)
+
+    def get_job_metrics(
+        self,
+        job_id: str,
+        *,
+        metric_window: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clean_id = str(job_id or "").strip()
+        if not clean_id:
+            raise ValueError("job_id must not be empty.")
+        query = (
+            "SELECT * FROM publication_metrics WHERE job_id=?"
+            + (" AND metric_window=?" if metric_window is not None else "")
+            + " ORDER BY collected_at DESC, rowid DESC"
+        )
+        params: tuple[Any, ...] = (clean_id,)
+        if metric_window is not None:
+            window = str(metric_window or "").strip()
+            if window not in SUPPORTED_ANALYTICS_WINDOWS:
+                raise ValueError("metric_window must be one of 24h, 7d, or 30d.")
+            params = (clean_id, window)
+        with self._new_connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_campaign_metrics_summary(
+        self,
+        campaign_id: str,
+        *,
+        metric_window: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clean_id = str(campaign_id or "").strip()
+        if not clean_id:
+            raise ValueError("campaign_id must not be empty.")
+        window = str(metric_window or "").strip() if metric_window is not None else None
+        if window is not None and window not in SUPPORTED_ANALYTICS_WINDOWS:
+            raise ValueError("metric_window must be one of 24h, 7d, or 30d.")
+        with self._new_connection() as connection:
+            query = (
+                "SELECT * FROM publication_metrics WHERE campaign_id=?"
+                + (" AND metric_window=?" if window is not None else "")
+                + " ORDER BY collected_at DESC, rowid DESC"
+            )
+            params: tuple[Any, ...] = (clean_id,)
+            if window is not None:
+                params = (clean_id, window)
+            rows = connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
     def mark_published(
