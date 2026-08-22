@@ -8,7 +8,9 @@ transforms have been applied:
 This keeps Groq as the content-generation provider. It adds the publishing path
 after final Senior Design Approval, applies the professional Brand Kit/Gemini UX,
 the current Gemini JPEG response requirement, then adds Cloudflare Workers AI as
-the free-first image provider while retaining Gemini and Manual Upload.
+the free-first image provider while retaining Gemini and Manual Upload. The final
+Cloudflare compatibility pass keeps the REST payload aligned with the provider's
+current FLUX.1 Schnell validation.
 """
 
 from __future__ import annotations
@@ -37,9 +39,10 @@ def main() -> None:
     run_script("apply_professional_ux_compile_hotfix.py")
     run_script("apply_gemini_jpeg_response_format.py")
     run_script("apply_cloudflare_creative_provider.py")
+    run_script("apply_cloudflare_rest_seed_hotfix.py")
     print(
         "Complete Meta publishing + professional UX + Cloudflare free-first creative provider applied. "
-        "Gemini retained; Groq content flow unchanged."
+        "Cloudflare REST compatibility fixed; Gemini retained; Groq content flow unchanged."
     )
 
 
