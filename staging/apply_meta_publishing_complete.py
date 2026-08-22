@@ -33,6 +33,7 @@ def main() -> None:
     run_script("apply_meta_publishing_ui.py")
     run_script("apply_publishing_final_hardening.py")
     run_script("apply_professional_ux_and_gemini_diagnostics.py")
+    run_script("apply_professional_ux_compile_hotfix.py")
     print(
         "Complete Meta image publishing + professional UX applied. "
         "Groq content flow unchanged."
