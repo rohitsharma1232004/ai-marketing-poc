@@ -6,7 +6,8 @@ transforms have been applied:
     python staging/apply_meta_publishing_complete.py
 
 This keeps Groq as the content-generation provider. It only adds the publishing
-path after final Senior Design Approval.
+path after final Senior Design Approval, then applies the final Brand Kit and
+Gemini diagnostic UX polish.
 """
 
 from __future__ import annotations
@@ -31,7 +32,11 @@ def run_script(name: str) -> None:
 def main() -> None:
     run_script("apply_meta_publishing_ui.py")
     run_script("apply_publishing_final_hardening.py")
-    print("Complete Meta image publishing feature applied. Groq content flow unchanged.")
+    run_script("apply_professional_ux_and_gemini_diagnostics.py")
+    print(
+        "Complete Meta image publishing + professional UX applied. "
+        "Groq content flow unchanged."
+    )
 
 
 if __name__ == "__main__":
