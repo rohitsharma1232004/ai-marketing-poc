@@ -5,9 +5,10 @@ transforms have been applied:
 
     python staging/apply_meta_publishing_complete.py
 
-This keeps Groq as the content-generation provider. It only adds the publishing
-path after final Senior Design Approval, then applies the final Brand Kit and
-Gemini diagnostic UX polish plus the current Gemini JPEG response requirement.
+This keeps Groq as the content-generation provider. It adds the publishing path
+after final Senior Design Approval, applies the professional Brand Kit/Gemini UX,
+the current Gemini JPEG response requirement, then adds Cloudflare Workers AI as
+the free-first image provider while retaining Gemini and Manual Upload.
 """
 
 from __future__ import annotations
@@ -35,9 +36,10 @@ def main() -> None:
     run_script("apply_professional_ux_and_gemini_diagnostics.py")
     run_script("apply_professional_ux_compile_hotfix.py")
     run_script("apply_gemini_jpeg_response_format.py")
+    run_script("apply_cloudflare_creative_provider.py")
     print(
-        "Complete Meta image publishing + professional UX + Gemini JPEG fix applied. "
-        "Groq content flow unchanged."
+        "Complete Meta publishing + professional UX + Cloudflare free-first creative provider applied. "
+        "Gemini retained; Groq content flow unchanged."
     )
 
 
