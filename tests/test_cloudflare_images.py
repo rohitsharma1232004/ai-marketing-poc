@@ -48,20 +48,18 @@ def test_cloudflare_flux_uses_official_rest_endpoint_and_decodes_jpeg():
         api_token="secret-token",
         aspect_ratio="4:5",
         request_id="req-cf-1",
-        seed=123,
         http_client=client,
     )
     assert result.image_bytes == raw
     assert result.mime_type == "image/jpeg"
     assert result.width == 40
     assert result.height == 30
-    assert result.seed == 123
     assert result.model == DEFAULT_CLOUDFLARE_IMAGE_MODEL
     url, call = client.calls[0]
     assert url.endswith(f"/ai/run/{DEFAULT_CLOUDFLARE_IMAGE_MODEL}")
     assert call["headers"]["Authorization"] == "Bearer secret-token"
     assert call["json"]["steps"] == 4
-    assert call["json"]["seed"] == 123
+    assert "seed" not in call["json"]
     assert "4:5 social-media layout" in call["json"]["prompt"]
 
 
