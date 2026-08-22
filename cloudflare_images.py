@@ -11,7 +11,6 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-import secrets
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any, Mapping
@@ -35,7 +34,6 @@ class CloudflareImageResult:
     model: str
     aspect_ratio: str
     image_size: str
-    seed: int
     steps: int
     width: int
     height: int
@@ -148,11 +146,15 @@ def generate_image(
     model: str = DEFAULT_CLOUDFLARE_IMAGE_MODEL,
     aspect_ratio: str = "4:5",
     steps: int = 4,
-    seed: int | None = None,
     request_id: str | None = None,
     http_client: Any = requests,
 ) -> CloudflareImageResult:
-    """Generate one JPEG creative through Cloudflare Workers AI FLUX.1 Schnell."""
+    """Generate one JPEG creative through Cloudflare Workers AI FLUX.1 Schnell.
+
+    Cloudflare's current REST validation for this model rejects ``seed`` even
+    though some Workers binding/docs examples still show it. Keep the REST
+    payload to the model's accepted prompt + steps schema.
+    """
 
     correlation_id = request_id or str(uuid4())
     clean_account = _clean_account_id(account_id)
@@ -160,9 +162,6 @@ def generate_image(
     chosen_model = _clean_model(model)
     if not isinstance(steps, int) or isinstance(steps, bool) or not 1 <= steps <= 8:
         raise ValueError("Cloudflare FLUX steps must be an integer from 1 to 8.")
-    chosen_seed = seed if seed is not None else secrets.randbelow(2_147_483_646) + 1
-    if not isinstance(chosen_seed, int) or isinstance(chosen_seed, bool) or chosen_seed < 0:
-        raise ValueError("Cloudflare seed must be a non-negative integer.")
 
     provider_prompt, prompt_compacted = _prepare_prompt(prompt, aspect_ratio)
     url = (
@@ -180,7 +179,6 @@ def generate_image(
             json={
                 "prompt": provider_prompt,
                 "steps": steps,
-                "seed": chosen_seed,
             },
             timeout=(5, 180),
         )
@@ -309,7 +307,6 @@ def generate_image(
         model=chosen_model,
         aspect_ratio=str(aspect_ratio or "4:5"),
         image_size=f"{width}x{height}",
-        seed=chosen_seed,
         steps=steps,
         width=width,
         height=height,
