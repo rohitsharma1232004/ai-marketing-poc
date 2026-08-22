@@ -106,6 +106,7 @@ def test_recommended_ratios_match_social_formats():
 
 
 def test_provider_registry_keeps_optional_enterprise_integrations_disabled():
+    assert provider_capability("cloudflare")["available_in_app"] is True
     assert provider_capability("gemini")["available_in_app"] is True
     assert provider_capability("manual_upload")["available_in_app"] is True
     assert provider_capability("canva")["available_in_app"] is False
